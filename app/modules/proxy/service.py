@@ -1812,11 +1812,14 @@ class ProxyService:
         base_settings = get_settings()
         max_attempts = _WEBSOCKET_MAX_ACCOUNT_ATTEMPTS
         excluded_account_ids: set[str] = set()
+        last_failover_exc: ProxyResponseError | None = None
+        last_failover_account: Account | None = None
         for attempt in range(max_attempts):
+            is_retry = attempt > 0
             account = await self._select_websocket_connect_account(
                 deadline,
-                sticky_key=sticky_key,
-                sticky_kind=sticky_kind,
+                sticky_key=None if is_retry else sticky_key,
+                sticky_kind=None if is_retry else sticky_kind,
                 prefer_earlier_reset=prefer_earlier_reset,
                 routing_strategy=routing_strategy,
                 model=model,
@@ -1824,11 +1827,26 @@ class ProxyService:
                 api_key=api_key,
                 client_send_lock=client_send_lock,
                 websocket=websocket,
-                reallocate_sticky=reallocate_sticky,
+                reallocate_sticky=False if is_retry else reallocate_sticky,
                 sticky_max_age_seconds=sticky_max_age_seconds,
                 exclude_account_ids=excluded_account_ids,
             )
             if account is None:
+                if last_failover_exc is not None and last_failover_account is not None:
+                    error = _parse_openai_error(last_failover_exc.payload)
+                    error_code = _normalize_error_code(error.code if error else None, error.type if error else None)
+                    error_message = error.message if error else None
+                    await self._emit_websocket_connect_failure(
+                        websocket,
+                        client_send_lock=client_send_lock,
+                        account_id=last_failover_account.id,
+                        api_key=api_key,
+                        request_state=request_state,
+                        status_code=last_failover_exc.status_code,
+                        payload=last_failover_exc.payload,
+                        error_code=error_code or "upstream_error",
+                        error_message=error_message or "Upstream error",
+                    )
                 return None, None
 
             try:
@@ -1851,6 +1869,8 @@ class ProxyService:
                     deterministic_failover_enabled=getattr(base_settings, "deterministic_failover_enabled", True),
                 )
                 if action == "failover_next":
+                    last_failover_exc = exc
+                    last_failover_account = account
                     excluded_account_ids.add(account.id)
                     continue
                 error = _parse_openai_error(exc.payload)
@@ -2152,8 +2172,7 @@ class ProxyService:
         else:
             action = "surface"
         logger.info(
-            "Failover decision request_id=%s transport=websocket account_id=%s "
-            "attempt=%d failure_class=%s action=%s",
+            "Failover decision request_id=%s transport=websocket account_id=%s attempt=%d failure_class=%s action=%s",
             request_state.request_log_id or request_state.request_id,
             account.id,
             attempt,
