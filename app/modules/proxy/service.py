@@ -1818,8 +1818,8 @@ class ProxyService:
             is_retry = attempt > 0
             account = await self._select_websocket_connect_account(
                 deadline,
-                sticky_key=None if is_retry else sticky_key,
-                sticky_kind=None if is_retry else sticky_kind,
+                sticky_key=sticky_key,
+                sticky_kind=sticky_kind,
                 prefer_earlier_reset=prefer_earlier_reset,
                 routing_strategy=routing_strategy,
                 model=model,
@@ -1827,26 +1827,11 @@ class ProxyService:
                 api_key=api_key,
                 client_send_lock=client_send_lock,
                 websocket=websocket,
-                reallocate_sticky=False if is_retry else reallocate_sticky,
+                reallocate_sticky=True if is_retry else reallocate_sticky,
                 sticky_max_age_seconds=sticky_max_age_seconds,
                 exclude_account_ids=excluded_account_ids,
             )
             if account is None:
-                if last_failover_exc is not None and last_failover_account is not None:
-                    error = _parse_openai_error(last_failover_exc.payload)
-                    error_code = _normalize_error_code(error.code if error else None, error.type if error else None)
-                    error_message = error.message if error else None
-                    await self._emit_websocket_connect_failure(
-                        websocket,
-                        client_send_lock=client_send_lock,
-                        account_id=last_failover_account.id,
-                        api_key=api_key,
-                        request_state=request_state,
-                        status_code=last_failover_exc.status_code,
-                        payload=last_failover_exc.payload,
-                        error_code=error_code or "upstream_error",
-                        error_message=error_message or "Upstream error",
-                    )
                 return None, None
 
             try:
@@ -1892,6 +1877,22 @@ class ProxyService:
             if connect_result is None:
                 return None, None
             return connect_result
+
+        if last_failover_exc is not None and last_failover_account is not None:
+            error = _parse_openai_error(last_failover_exc.payload)
+            error_code = _normalize_error_code(error.code if error else None, error.type if error else None)
+            error_message = error.message if error else None
+            await self._emit_websocket_connect_failure(
+                websocket,
+                client_send_lock=client_send_lock,
+                account_id=last_failover_account.id,
+                api_key=api_key,
+                request_state=request_state,
+                status_code=last_failover_exc.status_code,
+                payload=last_failover_exc.payload,
+                error_code=error_code or "upstream_error",
+                error_message=error_message or "Upstream error",
+            )
         return None, None
 
     async def _select_websocket_connect_account(
