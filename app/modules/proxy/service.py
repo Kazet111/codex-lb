@@ -8,7 +8,7 @@ import logging
 import re
 import time
 from collections import deque
-from collections.abc import Collection, Sequence
+from collections.abc import AsyncGenerator, Collection, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -638,6 +638,138 @@ class ProxyService:
                         session.last_used_at = time.monotonic()
                 return
         session = session_or_forward
+        session_events: AsyncGenerator[str, None] = self._stream_http_bridge_session_events(
+            session,
+            request_state=request_state,
+            text_data=text_data,
+            queue_limit=queue_limit,
+            propagate_http_errors=propagate_http_errors,
+            downstream_turn_state=downstream_turn_state,
+        )
+        try:
+            async for event_block in session_events:
+                yield event_block
+        except ProxyResponseError as exc:
+            should_attempt_previous_response_recovery = (
+                effective_payload.previous_response_id is not None
+                and _http_bridge_should_attempt_local_previous_response_recovery(exc)
+            )
+            if not should_attempt_previous_response_recovery:
+                raise
+
+            if PROMETHEUS_AVAILABLE and bridge_durable_recover_total is not None:
+                bridge_durable_recover_total.labels(path="local_previous_response_error").inc()
+            _log_http_bridge_event(
+                "previous_response_recover_local",
+                bridge_session_key,
+                account_id=None,
+                model=effective_payload.model,
+                detail="outcome=local_rebind_after_local_error",
+                cache_key_family=bridge_session_key.affinity_kind,
+                model_class=_extract_model_class(effective_payload.model) if effective_payload.model else None,
+                owner_check_applied=True,
+            )
+
+            async with self._http_bridge_lock:
+                if self._http_bridge_sessions.get(session.key) is session:
+                    self._http_bridge_sessions.pop(session.key, None)
+            async with session.pending_lock:
+                session.queued_request_count = 0
+            await self._fail_pending_websocket_requests(
+                account_id_value=session.account.id,
+                pending_requests=session.pending_requests,
+                pending_lock=session.pending_lock,
+                error_code="stream_incomplete",
+                error_message="Upstream websocket closed before response.completed",
+                api_key=None,
+                response_create_gate=session.response_create_gate,
+            )
+            await self._close_http_bridge_session(session)
+
+            session = await self._get_or_create_http_bridge_session(
+                bridge_session_key,
+                headers=dict(headers),
+                affinity=affinity,
+                api_key=api_key,
+                request_model=effective_payload.model,
+                idle_ttl_seconds=_effective_http_bridge_idle_ttl_seconds(
+                    affinity=affinity,
+                    idle_ttl_seconds=idle_ttl_seconds,
+                    codex_idle_ttl_seconds=codex_idle_ttl_seconds,
+                    prompt_cache_idle_ttl_seconds=prompt_cache_idle_ttl_seconds,
+                ),
+                max_sessions=max_sessions,
+                previous_response_id=request_state.previous_response_id,
+                gateway_safe_mode=runtime_config.gateway_safe_mode,
+                allow_forward_to_owner=False,
+                forwarded_request=False,
+                allow_previous_response_recovery_rebind=True,
+                durable_lookup=durable_lookup,
+                request_stage="reattach",
+                preferred_account_id=request_state.preferred_account_id,
+            )
+            _record_bridge_reattach(path="local_previous_response_error", outcome="success")
+
+            try:
+                retry_api_key_reservation = api_key_reservation
+                retry_reservation_reacquired = False
+                if api_key is not None and api_key_reservation is not None:
+                    retry_api_key_reservation = await self._reserve_websocket_api_key_usage(
+                        api_key,
+                        request_model=effective_payload.model,
+                        request_service_tier=_normalize_service_tier_value(
+                            dict(effective_payload.to_payload()).get("service_tier"),
+                        ),
+                    )
+                    retry_reservation_reacquired = True
+
+                retry_request_state, retry_text_data = self._prepare_http_bridge_request(
+                    effective_payload,
+                    headers,
+                    api_key=api_key,
+                    api_key_reservation=retry_api_key_reservation,
+                    request_id=request_id,
+                )
+                retry_request_state.transport = _REQUEST_TRANSPORT_HTTP
+                retry_request_state.request_stage = request_state.request_stage
+                retry_request_state.preferred_account_id = request_state.preferred_account_id
+
+                retry_events: AsyncGenerator[str, None] = self._stream_http_bridge_session_events(
+                    session,
+                    request_state=retry_request_state,
+                    text_data=retry_text_data,
+                    queue_limit=queue_limit,
+                    propagate_http_errors=propagate_http_errors,
+                    downstream_turn_state=downstream_turn_state,
+                )
+                try:
+                    async for event_block in retry_events:
+                        yield event_block
+                finally:
+                    try:
+                        await retry_events.aclose()
+                    except Exception:
+                        pass
+            except BaseException:
+                if retry_reservation_reacquired and retry_api_key_reservation is not None:
+                    await self._release_websocket_reservation(retry_api_key_reservation)
+                raise
+        finally:
+            try:
+                await session_events.aclose()
+            except Exception:
+                pass
+
+    async def _stream_http_bridge_session_events(
+        self,
+        session: "_HTTPBridgeSession",
+        *,
+        request_state: _WebSocketRequestState,
+        text_data: str,
+        queue_limit: int,
+        propagate_http_errors: bool,
+        downstream_turn_state: str | None,
+    ) -> AsyncGenerator[str, None]:
         await self._submit_http_bridge_request(
             session,
             request_state=request_state,
@@ -4150,7 +4282,7 @@ class ProxyService:
                     continue
                 if message.kind == "text" and message.text is not None:
                     downstream_activity.mark()
-                    await self._process_upstream_websocket_text(
+                    downstream_text = await self._process_upstream_websocket_text(
                         message.text,
                         account=account,
                         account_id_value=account_id_value,
@@ -4163,7 +4295,7 @@ class ProxyService:
                     await self._send_downstream_websocket_text(
                         websocket,
                         client_send_lock=client_send_lock,
-                        text=message.text,
+                        text=downstream_text,
                         downstream_activity=downstream_activity,
                     )
                     if upstream_control.reconnect_requested:
@@ -4218,7 +4350,7 @@ class ProxyService:
         api_key: ApiKeyData | None,
         upstream_control: _WebSocketUpstreamControl,
         response_create_gate: asyncio.Semaphore,
-    ) -> None:
+    ) -> str:
         event_block = f"data: {text}\n\n"
         payload = parse_sse_data_json(event_block)
         event = parse_sse_event(event_block)
@@ -4261,7 +4393,16 @@ class ProxyService:
             _release_websocket_response_create_gate(created_request_state, response_create_gate)
 
         if request_state is None:
-            return
+            return text
+
+        event, payload, event_type, downstream_text = _maybe_rewrite_websocket_previous_response_not_found_event(
+            request_state=request_state,
+            event=event,
+            payload=payload,
+            event_type=event_type,
+            upstream_control=upstream_control,
+            original_text=text,
+        )
 
         await self._finalize_websocket_request_state(
             request_state,
@@ -4274,6 +4415,7 @@ class ProxyService:
             upstream_control=upstream_control,
             response_create_gate=response_create_gate,
         )
+        return downstream_text
 
     async def _next_websocket_receive_timeout(
         self,
@@ -6374,6 +6516,113 @@ def _websocket_response_id(event: OpenAIEvent | None, payload: dict[str, JsonVal
     return stripped or None
 
 
+def _websocket_event_error_code(event_type: str | None, payload: dict[str, JsonValue] | None) -> str | None:
+    error = _websocket_event_error_payload(event_type, payload)
+    if not isinstance(error, dict):
+        return None
+    code_value = error.get("code")
+    if not isinstance(code_value, str):
+        return None
+    stripped = code_value.strip()
+    return stripped or None
+
+
+def _websocket_event_error_param(event_type: str | None, payload: dict[str, JsonValue] | None) -> str | None:
+    error = _websocket_event_error_payload(event_type, payload)
+    if not isinstance(error, dict):
+        return None
+    param_value = error.get("param")
+    if not isinstance(param_value, str):
+        return None
+    stripped = param_value.strip()
+    return stripped or None
+
+
+def _websocket_event_error_message(event_type: str | None, payload: dict[str, JsonValue] | None) -> str | None:
+    error = _websocket_event_error_payload(event_type, payload)
+    if not isinstance(error, dict):
+        return None
+    message_value = error.get("message")
+    if not isinstance(message_value, str):
+        return None
+    stripped = message_value.strip()
+    return stripped or None
+
+
+def _is_previous_response_not_found_message(message: str | None) -> bool:
+    if message is None:
+        return False
+    normalized = " ".join(message.lower().split())
+    return "previous response" in normalized and "not found" in normalized
+
+
+def _is_previous_response_not_found_error(
+    *,
+    code: str | None,
+    param: str | None,
+    message: str | None,
+) -> bool:
+    if code == "previous_response_not_found":
+        return True
+    if code != "invalid_request_error" or param != "previous_response_id":
+        return False
+    return _is_previous_response_not_found_message(message)
+
+
+def _websocket_event_error_payload(
+    event_type: str | None,
+    payload: dict[str, JsonValue] | None,
+) -> dict[str, JsonValue] | None:
+    if not isinstance(payload, dict):
+        return None
+    if event_type == "error":
+        error = payload.get("error")
+    elif event_type == "response.failed":
+        response = payload.get("response")
+        error = response.get("error") if isinstance(response, dict) else None
+    else:
+        return None
+    return cast(dict[str, JsonValue], error) if isinstance(error, dict) else None
+
+
+def _maybe_rewrite_websocket_previous_response_not_found_event(
+    *,
+    request_state: _WebSocketRequestState,
+    event: OpenAIEvent | None,
+    payload: dict[str, JsonValue] | None,
+    event_type: str | None,
+    upstream_control: _WebSocketUpstreamControl,
+    original_text: str,
+) -> tuple[OpenAIEvent | None, dict[str, JsonValue] | None, str | None, str]:
+    if request_state.previous_response_id is None:
+        return event, payload, event_type, original_text
+
+    error_code = _websocket_event_error_code(event_type, payload)
+    error_param = _websocket_event_error_param(event_type, payload)
+    error_message = _websocket_event_error_message(event_type, payload)
+    should_rewrite = _is_previous_response_not_found_error(
+        code=error_code,
+        param=error_param,
+        message=error_message,
+    )
+    if not should_rewrite:
+        return event, payload, event_type, original_text
+
+    upstream_control.reconnect_requested = True
+    rewritten_event_payload = response_failed_event(
+        "stream_incomplete",
+        "Upstream websocket closed before response.completed",
+        error_type="server_error",
+        response_id=request_state.response_id or request_state.request_id,
+    )
+    rewritten_text = json.dumps(rewritten_event_payload, ensure_ascii=True, separators=(",", ":"))
+    rewritten_event_block = format_sse_event(rewritten_event_payload)
+    rewritten_payload = parse_sse_data_json(rewritten_event_block)
+    rewritten_event = parse_sse_event(rewritten_event_block)
+    rewritten_event_type = _event_type_from_payload(rewritten_event, rewritten_payload)
+    return rewritten_event, rewritten_payload, rewritten_event_type, rewritten_text
+
+
 def _find_websocket_request_state_by_response_id(
     pending_requests: deque[_WebSocketRequestState],
     response_id: str,
@@ -7744,11 +7993,17 @@ def _http_bridge_should_attempt_local_previous_response_recovery(exc: ProxyRespo
     if not isinstance(error, dict):
         return False
     code = error.get("code")
-    return code in {
+    if code in {
         "bridge_owner_unreachable",
         "previous_response_not_found",
         "bridge_instance_mismatch",
-    }
+    }:
+        return True
+    param_value = error.get("param")
+    param = param_value.strip() if isinstance(param_value, str) and param_value.strip() else None
+    message_value = error.get("message")
+    message = message_value.strip() if isinstance(message_value, str) and message_value.strip() else None
+    return _is_previous_response_not_found_error(code=code, param=param, message=message)
 
 
 def _http_bridge_should_attempt_local_bootstrap_rebind(

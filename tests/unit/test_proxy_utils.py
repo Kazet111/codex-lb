@@ -4495,6 +4495,263 @@ async def test_process_upstream_websocket_text_does_not_match_foreign_response_i
     assert list(pending_requests) == [pending_request]
 
 
+def test_maybe_rewrite_websocket_previous_response_not_found_rewrites_response_failed_event():
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="ws_req_prev_nf",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        response_id="resp_prev_nf",
+        previous_response_id="resp_prev_anchor",
+    )
+    original_payload: dict[str, JsonValue] = {
+        "type": "response.failed",
+        "response": {
+            "id": "resp_prev_nf",
+            "status": "failed",
+            "error": {
+                "type": "invalid_request_error",
+                "code": "previous_response_not_found",
+                "message": "Previous response with id 'resp_prev_anchor' not found.",
+                "param": "previous_response_id",
+            },
+        },
+    }
+    original_text = json.dumps(original_payload, separators=(",", ":"))
+    original_event = parse_sse_event(f"data: {original_text}\n\n")
+    assert original_event is not None
+    original_event_type = proxy_service._event_type_from_payload(original_event, original_payload)
+    upstream_control = proxy_service._WebSocketUpstreamControl()
+
+    _, rewritten_payload, rewritten_event_type, rewritten_text = (
+        proxy_service._maybe_rewrite_websocket_previous_response_not_found_event(
+            request_state=request_state,
+            event=original_event,
+            payload=original_payload,
+            event_type=original_event_type,
+            upstream_control=upstream_control,
+            original_text=original_text,
+        )
+    )
+
+    assert upstream_control.reconnect_requested is True
+    assert rewritten_event_type == "response.failed"
+    assert rewritten_payload is not None
+    response_payload = cast(dict[str, JsonValue], rewritten_payload.get("response"))
+    error_payload = cast(dict[str, JsonValue], response_payload.get("error"))
+    assert error_payload["code"] == "stream_incomplete"
+    assert error_payload["message"] == "Upstream websocket closed before response.completed"
+    assert "previous_response_not_found" not in rewritten_text
+
+
+def test_maybe_rewrite_websocket_previous_response_invalid_request_error_rewrites_when_message_is_not_found():
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="ws_req_prev_invalid",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        response_id="resp_prev_invalid",
+        previous_response_id="resp_prev_anchor",
+    )
+    original_payload: dict[str, JsonValue] = {
+        "type": "error",
+        "status": 400,
+        "error": {
+            "type": "invalid_request_error",
+            "code": "invalid_request_error",
+            "message": "Previous response with id 'resp_prev_anchor' not found.",
+            "param": "previous_response_id",
+        },
+    }
+    original_text = json.dumps(original_payload, separators=(",", ":"))
+    original_event = parse_sse_event(f"data: {original_text}\n\n")
+    assert original_event is not None
+    original_event_type = proxy_service._event_type_from_payload(original_event, original_payload)
+    upstream_control = proxy_service._WebSocketUpstreamControl()
+
+    _, rewritten_payload, rewritten_event_type, rewritten_text = (
+        proxy_service._maybe_rewrite_websocket_previous_response_not_found_event(
+            request_state=request_state,
+            event=original_event,
+            payload=original_payload,
+            event_type=original_event_type,
+            upstream_control=upstream_control,
+            original_text=original_text,
+        )
+    )
+
+    assert upstream_control.reconnect_requested is True
+    assert rewritten_event_type == "response.failed"
+    assert rewritten_payload is not None
+    response_payload = cast(dict[str, JsonValue], rewritten_payload.get("response"))
+    error_payload = cast(dict[str, JsonValue], response_payload.get("error"))
+    assert error_payload["code"] == "stream_incomplete"
+    assert error_payload["message"] == "Upstream websocket closed before response.completed"
+    assert "previous_response_not_found" not in rewritten_text
+
+
+def test_maybe_rewrite_websocket_previous_response_invalid_request_error_does_not_rewrite_other_message():
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="ws_req_prev_invalid_other_message",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        response_id="resp_prev_invalid_other_message",
+        previous_response_id="resp_prev_anchor",
+    )
+    original_payload: dict[str, JsonValue] = {
+        "type": "error",
+        "status": 400,
+        "error": {
+            "type": "invalid_request_error",
+            "code": "invalid_request_error",
+            "message": "Invalid request payload",
+            "param": "previous_response_id",
+        },
+    }
+    original_text = json.dumps(original_payload, separators=(",", ":"))
+    original_event = parse_sse_event(f"data: {original_text}\n\n")
+    assert original_event is not None
+    original_event_type = proxy_service._event_type_from_payload(original_event, original_payload)
+    upstream_control = proxy_service._WebSocketUpstreamControl()
+
+    _, rewritten_payload, rewritten_event_type, rewritten_text = (
+        proxy_service._maybe_rewrite_websocket_previous_response_not_found_event(
+            request_state=request_state,
+            event=original_event,
+            payload=original_payload,
+            event_type=original_event_type,
+            upstream_control=upstream_control,
+            original_text=original_text,
+        )
+    )
+
+    assert upstream_control.reconnect_requested is False
+    assert rewritten_event_type == original_event_type
+    assert rewritten_payload == original_payload
+    assert rewritten_text == original_text
+
+
+def test_maybe_rewrite_websocket_previous_response_invalid_request_error_does_not_rewrite_other_param():
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="ws_req_prev_invalid_other_param",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        response_id="resp_prev_invalid_other_param",
+        previous_response_id="resp_prev_anchor",
+    )
+    original_payload: dict[str, JsonValue] = {
+        "type": "error",
+        "status": 400,
+        "error": {
+            "type": "invalid_request_error",
+            "code": "invalid_request_error",
+            "message": "Invalid request payload",
+            "param": "input",
+        },
+    }
+    original_text = json.dumps(original_payload, separators=(",", ":"))
+    original_event = parse_sse_event(f"data: {original_text}\n\n")
+    assert original_event is not None
+    original_event_type = proxy_service._event_type_from_payload(original_event, original_payload)
+    upstream_control = proxy_service._WebSocketUpstreamControl()
+
+    _, rewritten_payload, rewritten_event_type, rewritten_text = (
+        proxy_service._maybe_rewrite_websocket_previous_response_not_found_event(
+            request_state=request_state,
+            event=original_event,
+            payload=original_payload,
+            event_type=original_event_type,
+            upstream_control=upstream_control,
+            original_text=original_text,
+        )
+    )
+
+    assert upstream_control.reconnect_requested is False
+    assert rewritten_event_type == original_event_type
+    assert rewritten_payload == original_payload
+    assert rewritten_text == original_text
+
+
+def test_http_bridge_should_attempt_local_previous_response_recovery_invalid_request_requires_not_found_message():
+    recoverable_error = proxy_module.ProxyResponseError(
+        400,
+        {
+            "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_request_error",
+                "message": "Previous response with id 'resp_prev_anchor' not found.",
+                "param": "previous_response_id",
+            }
+        },
+    )
+    non_recoverable_error = proxy_module.ProxyResponseError(
+        400,
+        {
+            "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_request_error",
+                "message": "Invalid request payload",
+                "param": "previous_response_id",
+            }
+        },
+    )
+
+    assert proxy_service._http_bridge_should_attempt_local_previous_response_recovery(recoverable_error) is True
+    assert proxy_service._http_bridge_should_attempt_local_previous_response_recovery(non_recoverable_error) is False
+
+
+def test_maybe_rewrite_websocket_previous_response_not_found_leaves_non_previous_request_unchanged():
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="ws_req_plain",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+    )
+    original_payload: dict[str, JsonValue] = {
+        "type": "error",
+        "status": 400,
+        "error": {
+            "type": "invalid_request_error",
+            "code": "previous_response_not_found",
+            "message": "Previous response with id 'resp_any' not found.",
+            "param": "previous_response_id",
+        },
+    }
+    original_text = json.dumps(original_payload, separators=(",", ":"))
+    original_event = parse_sse_event(f"data: {original_text}\n\n")
+    assert original_event is not None
+    original_event_type = proxy_service._event_type_from_payload(original_event, original_payload)
+    upstream_control = proxy_service._WebSocketUpstreamControl()
+
+    _, rewritten_payload, rewritten_event_type, rewritten_text = (
+        proxy_service._maybe_rewrite_websocket_previous_response_not_found_event(
+            request_state=request_state,
+            event=original_event,
+            payload=original_payload,
+            event_type=original_event_type,
+            upstream_control=upstream_control,
+            original_text=original_text,
+        )
+    )
+
+    assert upstream_control.reconnect_requested is False
+    assert rewritten_event_type == original_event_type
+    assert rewritten_payload == original_payload
+    assert rewritten_text == original_text
+
+
 @pytest.mark.asyncio
 async def test_stream_responses_budget_exhaustion_emits_timeout_event(monkeypatch):
     settings = _make_proxy_settings(log_proxy_service_tier_trace=False)
