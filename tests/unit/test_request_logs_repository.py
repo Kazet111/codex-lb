@@ -158,4 +158,3 @@ async def test_find_latest_account_id_for_response_id_falls_back_when_session_sc
     assert len(executed_sql) == 2
     assert "request_logs.session_id = :session_id_1" in executed_sql[0]
     assert "request_logs.session_id = :session_id_1" not in executed_sql[1]
-

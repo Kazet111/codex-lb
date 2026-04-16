@@ -1371,9 +1371,9 @@ async def test_stream_via_http_bridge_does_not_inject_durable_anchor_for_live_tu
         idle_ttl_seconds=120.0,
     )
     service._http_bridge_sessions[session_key] = session
-    service._http_bridge_turn_state_index[
-        proxy_service._http_bridge_turn_state_alias_key("http_turn_live", None)
-    ] = session_key
+    service._http_bridge_turn_state_index[proxy_service._http_bridge_turn_state_alias_key("http_turn_live", None)] = (
+        session_key
+    )
 
     monkeypatch.setattr(
         proxy_service,

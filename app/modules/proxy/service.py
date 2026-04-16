@@ -495,8 +495,7 @@ class ProxyService:
             if (
                 not live_local_session_exists
                 and not forwards_to_active_owner
-                and
-                payload.previous_response_id is None
+                and payload.previous_response_id is None
                 and bridge_session_key.strength == "hard"
                 and durable_lookup.latest_response_id is not None
                 and not _http_bridge_payload_looks_like_full_resend(payload)
@@ -3336,12 +3335,9 @@ class ProxyService:
                             ),
                         )
                     elif missing_turn_state_alias and inflight_future is None and durable_lookup is None:
-                        turn_state_scope_conflict = (
-                            incoming_turn_state is not None
-                            and any(
-                                alias == incoming_turn_state and alias_api_key != api_key_id
-                                for alias, alias_api_key in self._http_bridge_turn_state_index
-                            )
+                        turn_state_scope_conflict = incoming_turn_state is not None and any(
+                            alias == incoming_turn_state and alias_api_key != api_key_id
+                            for alias, alias_api_key in self._http_bridge_turn_state_index
                         )
                         if turn_state_scope_conflict:
                             continuity_error = ProxyResponseError(
@@ -4685,7 +4681,9 @@ class ProxyService:
         self._websocket_previous_response_account_index.pop(cache_key, None)
         self._websocket_previous_response_account_index[cache_key] = account_id_value
         while len(self._websocket_previous_response_account_index) > _WEBSOCKET_PREVIOUS_RESPONSE_ACCOUNT_CACHE_LIMIT:
-            self._websocket_previous_response_account_index.pop(next(iter(self._websocket_previous_response_account_index)))
+            self._websocket_previous_response_account_index.pop(
+                next(iter(self._websocket_previous_response_account_index))
+            )
 
     def _remember_websocket_previous_response_owner_miss(
         self,

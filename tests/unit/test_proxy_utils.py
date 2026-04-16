@@ -3076,9 +3076,7 @@ def test_sticky_key_from_session_header_accepts_aliases_in_priority_order():
 def test_owner_lookup_session_id_from_headers_prefers_turn_state_then_session_aliases():
     assert proxy_service._owner_lookup_session_id_from_headers({"x-codex-turn-state": "turn_1"}) == "turn_1"
     assert (
-        proxy_service._owner_lookup_session_id_from_headers(
-            {"x-codex-turn-state": "turn_1", "session_id": "sid_1"}
-        )
+        proxy_service._owner_lookup_session_id_from_headers({"x-codex-turn-state": "turn_1", "session_id": "sid_1"})
         == "turn_1"
     )
     assert proxy_service._owner_lookup_session_id_from_headers({"x-codex-session-id": "sid_2"}) == "sid_2"

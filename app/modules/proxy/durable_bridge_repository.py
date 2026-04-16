@@ -106,9 +106,7 @@ class DurableBridgeRepository:
             .where(
                 HttpBridgeSessionRecord.latest_turn_state == turn_state,
                 HttpBridgeSessionRecord.api_key_scope == api_key_scope,
-                HttpBridgeSessionRecord.state.in_(
-                    (HttpBridgeSessionState.ACTIVE, HttpBridgeSessionState.DRAINING)
-                ),
+                HttpBridgeSessionRecord.state.in_((HttpBridgeSessionState.ACTIVE, HttpBridgeSessionState.DRAINING)),
             )
             .order_by(
                 case((HttpBridgeSessionRecord.state == HttpBridgeSessionState.ACTIVE, 0), else_=1),
@@ -132,9 +130,7 @@ class DurableBridgeRepository:
             .where(
                 HttpBridgeSessionRecord.latest_response_id == response_id,
                 HttpBridgeSessionRecord.api_key_scope == api_key_scope,
-                HttpBridgeSessionRecord.state.in_(
-                    (HttpBridgeSessionState.ACTIVE, HttpBridgeSessionState.DRAINING)
-                ),
+                HttpBridgeSessionRecord.state.in_((HttpBridgeSessionState.ACTIVE, HttpBridgeSessionState.DRAINING)),
             )
             .order_by(
                 case((HttpBridgeSessionRecord.state == HttpBridgeSessionState.ACTIVE, 0), else_=1),

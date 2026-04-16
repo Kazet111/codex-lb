@@ -104,7 +104,6 @@ class UsageHistory(Base):
 class AdditionalUsageHistory(Base):
     __tablename__ = "additional_usage_history"
 
-
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     account_id: Mapped[str] = mapped_column(String, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False)
     quota_key: Mapped[str] = mapped_column(String, nullable=False)
