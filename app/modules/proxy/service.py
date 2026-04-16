@@ -6812,7 +6812,7 @@ class ProxyService:
                             settlement.record_success = False
                             settlement.account_health_error = _should_penalize_stream_error(error_code)
                     if event_type in ("response.completed", "response.incomplete"):
-                        usage = event.response.usage if event.response else None
+                        usage = event.response.usage if event is not None and event.response else None
                         if event_type == "response.incomplete":
                             status = "error"
                 if latency_first_token_ms is None and event_type in _TEXT_DELTA_EVENT_TYPES:

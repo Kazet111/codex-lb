@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -558,10 +559,12 @@ async def test_v1_responses_without_http_bridge_websocket_upstream_slims_histori
     assert fake_upstream.sent_json
     request_input = fake_upstream.sent_json[0]["input"]
     assert isinstance(request_input, list)
-    assert request_input[1]["output"] == proxy_module._RESPONSE_CREATE_TOOL_OUTPUT_OMISSION_NOTICE.format(
+    tool_input = cast(dict[str, object], request_input[1])
+    assistant_input = cast(dict[str, object], request_input[2])
+    assert tool_input["output"] == proxy_module._RESPONSE_CREATE_TOOL_OUTPUT_OMISSION_NOTICE.format(
         bytes=len(("data:image/png;base64," + ("A" * 1200)).encode("utf-8"))
     )
-    assert request_input[2]["content"] == [
+    assert assistant_input["content"] == [
         {"type": "input_text", "text": proxy_module._RESPONSE_CREATE_IMAGE_OMISSION_NOTICE}
     ]
 

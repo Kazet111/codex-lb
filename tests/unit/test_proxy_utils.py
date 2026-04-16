@@ -4385,7 +4385,9 @@ async def test_select_websocket_connect_account_records_fail_closed_for_preferre
     )
 
     assert result is None
-    sent_payload = json.loads(websocket_send.await_args.args[0])
+    await_args = websocket_send.await_args
+    assert await_args is not None
+    sent_payload = json.loads(await_args.args[0])
     assert sent_payload["status"] == 502
     assert sent_payload["error"]["code"] == "upstream_unavailable"
     assert "continuity_fail_closed surface=websocket_connect reason=owner_account_unavailable" in caplog.text
@@ -4454,7 +4456,9 @@ async def test_select_websocket_connect_account_preferred_owner_missing_fails_cl
     )
 
     assert result is None
-    sent_payload = json.loads(websocket_send.await_args.args[0])
+    await_args = websocket_send.await_args
+    assert await_args is not None
+    sent_payload = json.loads(await_args.args[0])
     assert sent_payload["status"] == 502
     assert sent_payload["error"]["code"] == "upstream_unavailable"
     assert sent_payload["error"]["message"] == "Previous response owner account is unavailable; retry later."
@@ -7551,8 +7555,10 @@ async def test_stream_previous_response_owner_usage_limit_fails_closed(monkeypat
     assert len(select_account_calls) == 1
     assert select_account_calls[0]["account_ids"] == {account_owner.id}
     handle_stream_error.assert_awaited_once()
-    assert handle_stream_error.await_args.args[0] == account_owner
-    assert handle_stream_error.await_args.args[2] == "usage_limit_reached"
+    handle_await_args = handle_stream_error.await_args
+    assert handle_await_args is not None
+    assert handle_await_args.args[0] == account_owner
+    assert handle_await_args.args[2] == "usage_limit_reached"
     record_success.assert_not_awaited()
 
 

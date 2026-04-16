@@ -3688,7 +3688,8 @@ async def test_get_or_create_http_bridge_session_drops_stale_previous_response_m
     service._http_bridge_sessions[stale_key] = stale_session
     service._http_bridge_previous_response_index[alias_key] = stale_key
     monkeypatch.setattr(service, "_prune_http_bridge_sessions_locked", AsyncMock())
-    monkeypatch.setattr(service, "_create_http_bridge_session", AsyncMock(return_value=created_session))
+    create_http_bridge_session = AsyncMock(return_value=created_session)
+    monkeypatch.setattr(service, "_create_http_bridge_session", create_http_bridge_session)
     monkeypatch.setattr(service, "_claim_durable_http_bridge_session", AsyncMock())
     monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
     monkeypatch.setattr(proxy_service, "_http_bridge_owner_instance", AsyncMock(return_value="instance-a"))
@@ -3744,7 +3745,8 @@ async def test_get_or_create_http_bridge_session_allows_local_rebind_for_previou
         idle_ttl_seconds=120.0,
     )
     monkeypatch.setattr(service, "_prune_http_bridge_sessions_locked", AsyncMock())
-    monkeypatch.setattr(service, "_create_http_bridge_session", AsyncMock(return_value=created_session))
+    create_http_bridge_session = AsyncMock(return_value=created_session)
+    monkeypatch.setattr(service, "_create_http_bridge_session", create_http_bridge_session)
     monkeypatch.setattr(service, "_claim_durable_http_bridge_session", AsyncMock())
     monkeypatch.setattr(service, "_claim_durable_http_bridge_session", AsyncMock())
     monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
@@ -3798,7 +3800,8 @@ async def test_get_or_create_http_bridge_session_allows_local_rebind_for_bootstr
         idle_ttl_seconds=120.0,
     )
     monkeypatch.setattr(service, "_prune_http_bridge_sessions_locked", AsyncMock())
-    monkeypatch.setattr(service, "_create_http_bridge_session", AsyncMock(return_value=created_session))
+    create_http_bridge_session = AsyncMock(return_value=created_session)
+    monkeypatch.setattr(service, "_create_http_bridge_session", create_http_bridge_session)
     monkeypatch.setattr(service, "_claim_durable_http_bridge_session", AsyncMock())
     monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
     monkeypatch.setattr(proxy_service, "_http_bridge_owner_instance", AsyncMock(return_value="instance-b"))
@@ -3875,7 +3878,8 @@ async def test_get_or_create_http_bridge_session_recovers_locally_when_owner_end
         idle_ttl_seconds=120.0,
     )
     monkeypatch.setattr(service, "_prune_http_bridge_sessions_locked", AsyncMock())
-    monkeypatch.setattr(service, "_create_http_bridge_session", AsyncMock(return_value=created_session))
+    create_http_bridge_session = AsyncMock(return_value=created_session)
+    monkeypatch.setattr(service, "_create_http_bridge_session", create_http_bridge_session)
     claim_durable = AsyncMock()
     monkeypatch.setattr(service, "_claim_durable_http_bridge_session", claim_durable)
     monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
@@ -4545,7 +4549,8 @@ async def test_get_or_create_http_bridge_session_hard_continuity_lookup_failure_
         idle_ttl_seconds=120.0,
     )
     monkeypatch.setattr(service, "_prune_http_bridge_sessions_locked", AsyncMock())
-    monkeypatch.setattr(service, "_create_http_bridge_session", AsyncMock(return_value=created_session))
+    create_http_bridge_session = AsyncMock(return_value=created_session)
+    monkeypatch.setattr(service, "_create_http_bridge_session", create_http_bridge_session)
     monkeypatch.setattr(service, "_claim_durable_http_bridge_session", AsyncMock())
     monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
     monkeypatch.setattr(
@@ -4573,7 +4578,7 @@ async def test_get_or_create_http_bridge_session_hard_continuity_lookup_failure_
             max_sessions=8,
         )
 
-    service._create_http_bridge_session.assert_not_awaited()
+    create_http_bridge_session.assert_not_awaited()
     exc = exc_info.value
     assert exc.status_code == 502
     assert exc.payload["error"]["code"] == "upstream_unavailable"
