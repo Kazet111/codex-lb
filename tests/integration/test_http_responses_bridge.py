@@ -1248,15 +1248,11 @@ async def test_v1_responses_http_bridge_missing_turn_state_alias_with_previous_r
         )
 
     exc = exc_info.value
-    assert exc.status_code == 400
+    assert exc.status_code == 502
     assert exc.payload["error"] == {
-        "message": (
-            "Previous response with id 'resp_missing_alias' not found. "
-            "HTTP bridge continuity was lost. Replay x-codex-turn-state or retry with a stable prompt_cache_key."
-        ),
-        "type": "invalid_request_error",
-        "code": "previous_response_not_found",
-        "param": "previous_response_id",
+        "message": "Upstream websocket closed before response.completed",
+        "type": "server_error",
+        "code": "stream_incomplete",
     }
 
 
@@ -5834,15 +5830,11 @@ async def test_v1_responses_http_bridge_waits_for_inflight_session_before_contin
 
     assert service._http_bridge_sessions[key] is created_session
     exc = exc_info.value
-    assert exc.status_code == 400
+    assert exc.status_code == 502
     assert exc.payload["error"] == {
-        "message": (
-            "Previous response with id 'resp_inflight' not found. "
-            "HTTP bridge continuity was lost. Replay x-codex-turn-state or retry with a stable prompt_cache_key."
-        ),
-        "type": "invalid_request_error",
-        "code": "previous_response_not_found",
-        "param": "previous_response_id",
+        "message": "Upstream websocket closed before response.completed",
+        "type": "server_error",
+        "code": "stream_incomplete",
     }
 
 

@@ -78,6 +78,8 @@ from app.core.metrics.prometheus import (
     bridge_reattach_total,
     bridge_same_account_takeover_total,
     bridge_soft_local_rebind_total,
+    continuity_fail_closed_total,
+    continuity_owner_resolution_total,
 )
 from app.core.openai.exceptions import ClientPayloadError
 from app.core.openai.models import CompactResponsePayload, OpenAIEvent, OpenAIResponsePayload
@@ -541,13 +543,21 @@ class ProxyService:
                     )
                 )
             )
-            else None
+            else request_state.preferred_account_id
         )
+        if request_state.previous_response_id is not None and request_state.preferred_account_id is None:
+            request_state.preferred_account_id = await self._http_bridge_local_owner_account_id(
+                key=bridge_session_key,
+                incoming_turn_state=incoming_turn_state_header,
+                previous_response_id=request_state.previous_response_id,
+                api_key=api_key,
+            )
         if request_state.previous_response_id is not None and request_state.preferred_account_id is None:
             request_state.preferred_account_id = await self._resolve_websocket_previous_response_owner(
                 previous_response_id=request_state.previous_response_id,
                 api_key=api_key,
                 session_id=request_state.session_id,
+                surface="http_bridge",
             )
         session_or_forward = await self._get_or_create_http_bridge_session(
             bridge_session_key,
@@ -654,33 +664,64 @@ class ProxyService:
                     else "owner_forward_bootstrap",
                     outcome="success",
                 )
-                await self._submit_http_bridge_request(
-                    session,
-                    request_state=request_state,
-                    text_data=text_data,
-                    queue_limit=queue_limit,
-                )
-                if downstream_turn_state is not None:
-                    await self._register_http_bridge_turn_state(session, downstream_turn_state)
+                retry_request_state: _WebSocketRequestState | None = None
                 try:
-                    event_queue = request_state.event_queue
+                    retry_api_key_reservation = api_key_reservation
+                    retry_reservation_reacquired = False
+                    if api_key is not None and api_key_reservation is not None:
+                        retry_api_key_reservation = await self._reserve_websocket_api_key_usage(
+                            api_key,
+                            request_model=effective_payload.model,
+                            request_service_tier=_normalize_service_tier_value(
+                                dict(effective_payload.to_payload()).get("service_tier"),
+                            ),
+                        )
+                        retry_reservation_reacquired = True
+
+                    retry_request_state, retry_text_data = self._prepare_http_bridge_request(
+                        effective_payload,
+                        headers,
+                        api_key=api_key,
+                        api_key_reservation=retry_api_key_reservation,
+                        request_id=request_id,
+                    )
+                    if downstream_turn_state is not None:
+                        retry_request_state.session_id = _normalize_session_id(downstream_turn_state)
+                    retry_request_state.transport = _REQUEST_TRANSPORT_HTTP
+                    retry_request_state.request_stage = "reattach"
+                    retry_request_state.preferred_account_id = request_state.preferred_account_id
+
+                    await self._submit_http_bridge_request(
+                        session,
+                        request_state=retry_request_state,
+                        text_data=retry_text_data,
+                        queue_limit=queue_limit,
+                    )
+                    if downstream_turn_state is not None:
+                        await self._register_http_bridge_turn_state(session, downstream_turn_state)
+                    event_queue = retry_request_state.event_queue
                     assert event_queue is not None
                     while True:
                         event_block = await event_queue.get()
                         if event_block is None:
                             break
-                        if request_state.latency_first_token_ms is None:
+                        if retry_request_state.latency_first_token_ms is None:
                             block_payload = parse_sse_data_json(event_block)
                             block_event_type = _event_type_from_payload(None, block_payload)
                             if block_event_type in _TEXT_DELTA_EVENT_TYPES:
-                                request_state.latency_first_token_ms = int(
-                                    (time.monotonic() - request_state.started_at) * 1000
+                                retry_request_state.latency_first_token_ms = int(
+                                    (time.monotonic() - retry_request_state.started_at) * 1000
                                 )
                         yield event_block
+                except BaseException:
+                    if retry_reservation_reacquired and retry_api_key_reservation is not None:
+                        await self._release_websocket_reservation(retry_api_key_reservation)
+                    raise
                 finally:
-                    with anyio.CancelScope(shield=True):
-                        await self._detach_http_bridge_request(session, request_state=request_state)
-                        session.last_used_at = time.monotonic()
+                    if retry_request_state is not None:
+                        with anyio.CancelScope(shield=True):
+                            await self._detach_http_bridge_request(session, request_state=retry_request_state)
+                            session.last_used_at = time.monotonic()
                 return
         session = session_or_forward
         session_events: AsyncGenerator[str, None] = self._stream_http_bridge_session_events(
@@ -965,6 +1006,57 @@ class ProxyService:
                     continue
                 return True
         return False
+
+    async def _http_bridge_local_owner_account_id(
+        self,
+        *,
+        key: "_HTTPBridgeSessionKey",
+        incoming_turn_state: str | None,
+        previous_response_id: str,
+        api_key: ApiKeyData | None,
+    ) -> str | None:
+        api_key_id = api_key.id if api_key is not None else None
+        candidate_keys: list[_HTTPBridgeSessionKey] = [key]
+        async with self._http_bridge_lock:
+            if incoming_turn_state is not None:
+                alias_key = self._http_bridge_turn_state_index.get(
+                    _http_bridge_turn_state_alias_key(incoming_turn_state, api_key_id)
+                )
+                if alias_key is not None and alias_key not in candidate_keys:
+                    candidate_keys.append(alias_key)
+            previous_alias_key = _http_bridge_previous_response_alias_key(previous_response_id, api_key_id)
+            previous_key = self._http_bridge_previous_response_index.get(previous_alias_key)
+            if previous_key is not None and previous_key not in candidate_keys:
+                candidate_keys.append(previous_key)
+            for candidate_key in candidate_keys:
+                session = self._http_bridge_sessions.get(candidate_key)
+                if session is None or session.closed or session.account.status != AccountStatus.ACTIVE:
+                    continue
+                if not _http_bridge_session_allows_api_key(session, api_key):
+                    continue
+                if not _http_bridge_session_reusable_for_request(
+                    session=session,
+                    key=candidate_key,
+                    incoming_turn_state=incoming_turn_state,
+                    previous_response_id=previous_response_id,
+                ):
+                    continue
+                _record_continuity_owner_resolution(
+                    surface="http_bridge",
+                    source="local_bridge_session",
+                    outcome="hit",
+                    previous_response_id=previous_response_id,
+                    session_id=incoming_turn_state,
+                )
+                return session.account.id
+        _record_continuity_owner_resolution(
+            surface="http_bridge",
+            source="local_bridge_session",
+            outcome="miss",
+            previous_response_id=previous_response_id,
+            session_id=incoming_turn_state,
+        )
+        return None
 
     async def _http_bridge_can_forward_to_active_owner(
         self,
@@ -1829,11 +1921,42 @@ class ProxyService:
                     and request_state.previous_response_id is not None
                     and request_state.preferred_account_id is None
                 ):
-                    request_state.preferred_account_id = await self._resolve_websocket_previous_response_owner(
-                        previous_response_id=request_state.previous_response_id,
-                        api_key=request_state.api_key or api_key,
-                        session_id=request_state.session_id,
-                    )
+                    try:
+                        request_state.preferred_account_id = await self._resolve_websocket_previous_response_owner(
+                            previous_response_id=request_state.previous_response_id,
+                            api_key=request_state.api_key or api_key,
+                            session_id=request_state.session_id,
+                            surface="websocket",
+                        )
+                    except ProxyResponseError as exc:
+                        error = _parse_openai_error(exc.payload)
+                        error_code = _normalize_error_code(
+                            error.code if error else None,
+                            error.type if error else None,
+                        )
+                        error_message = error.message if error and error.message else "Upstream error"
+                        error_type = error.type if error and error.type else "server_error"
+                        await self._release_websocket_reservation(request_state.api_key_reservation)
+                        await self._write_websocket_connect_failure(
+                            account_id=None,
+                            api_key=api_key,
+                            request_state=request_state,
+                            error_code=error_code or "upstream_error",
+                            error_message=error_message,
+                        )
+                        await self._emit_websocket_terminal_error(
+                            websocket,
+                            client_send_lock=client_send_lock,
+                            request_state=request_state,
+                            error_code=error_code or "upstream_error",
+                            error_message=error_message,
+                            error_type=error_type,
+                            downstream_activity=downstream_activity,
+                        )
+                        request_state = None
+                        text_data = None
+                        payload = None
+                        continue
 
                 if request_state is not None and not request_state_registered:
                     try:
@@ -2195,6 +2318,7 @@ class ProxyService:
         response_create_gate: asyncio.Semaphore,
         compact: bool = False,
     ) -> None:
+        request_state.response_create_gate = response_create_gate
         await response_create_gate.acquire()
         request_state.response_create_gate_acquired = True
         request_state.awaiting_response_created = True
@@ -2368,6 +2492,13 @@ class ProxyService:
             and account.id != preferred_account_id
         ):
             message = "Previous response owner account is unavailable; retry later."
+            _record_continuity_fail_closed(
+                surface="websocket_connect",
+                reason="owner_account_unavailable",
+                previous_response_id=request_state.previous_response_id,
+                session_id=request_state.session_id,
+                upstream_error_code="upstream_unavailable",
+            )
             await self._emit_websocket_connect_failure(
                 websocket,
                 client_send_lock=client_send_lock,
@@ -2388,6 +2519,31 @@ class ProxyService:
             return account
         error_code = selection.error_code or "no_accounts"
         error_message = selection.error_message or "No active accounts available"
+        if require_preferred_account and preferred_account_id is not None:
+            message = "Previous response owner account is unavailable; retry later."
+            _record_continuity_fail_closed(
+                surface="websocket_connect",
+                reason="owner_account_unavailable",
+                previous_response_id=request_state.previous_response_id,
+                session_id=request_state.session_id,
+                upstream_error_code=error_code,
+            )
+            await self._emit_websocket_connect_failure(
+                websocket,
+                client_send_lock=client_send_lock,
+                account_id=preferred_account_id,
+                api_key=api_key,
+                request_state=request_state,
+                status_code=502,
+                payload=openai_error(
+                    "upstream_unavailable",
+                    message,
+                    error_type="server_error",
+                ),
+                error_code="upstream_unavailable",
+                error_message=message,
+            )
+            return None
         await self._emit_websocket_connect_failure(
             websocket,
             client_send_lock=client_send_lock,
@@ -2856,6 +3012,11 @@ class ProxyService:
                             alias_session is None
                             or alias_session.closed
                             or alias_session.account.status != AccountStatus.ACTIVE
+                            or not _http_bridge_session_matches_preferred_account(
+                                session=alias_session,
+                                previous_response_id=previous_response_id,
+                                preferred_account_id=preferred_account_id,
+                            )
                         ):
                             self._http_bridge_turn_state_index.pop(alias_index_key, None)
                             key = _HTTPBridgeSessionKey("turn_state_header", incoming_turn_state, api_key_id)
@@ -2877,28 +3038,35 @@ class ProxyService:
                                 api_key_id,
                             )
                             previous_key = self._http_bridge_previous_response_index.get(previous_alias_key)
+                            previous_session = None
                             if previous_key is not None:
                                 previous_session = self._http_bridge_sessions.get(previous_key)
-                                if (
-                                    previous_session is not None
-                                    and not previous_session.closed
-                                    and previous_session.account.status == AccountStatus.ACTIVE
-                                ):
-                                    key = previous_session.key
-                                    self._promote_http_bridge_session_to_codex_affinity(
-                                        previous_session,
-                                        turn_state=incoming_turn_state,
-                                        settings=settings,
-                                    )
-                                    previous_session.downstream_turn_state_aliases.add(incoming_turn_state)
-                                    for alias in previous_session.downstream_turn_state_aliases:
-                                        self._http_bridge_turn_state_index[
-                                            _http_bridge_turn_state_alias_key(
-                                                alias,
-                                                previous_session.key.api_key_id,
-                                            )
-                                        ] = previous_session.key
-                                    continue
+                            if (
+                                previous_session is not None
+                                and not previous_session.closed
+                                and previous_session.account.status == AccountStatus.ACTIVE
+                                and _http_bridge_session_matches_preferred_account(
+                                    session=previous_session,
+                                    previous_response_id=previous_response_id,
+                                    preferred_account_id=preferred_account_id,
+                                )
+                            ):
+                                key = previous_session.key
+                                self._promote_http_bridge_session_to_codex_affinity(
+                                    previous_session,
+                                    turn_state=incoming_turn_state,
+                                    settings=settings,
+                                )
+                                previous_session.downstream_turn_state_aliases.add(incoming_turn_state)
+                                for alias in previous_session.downstream_turn_state_aliases:
+                                    self._http_bridge_turn_state_index[
+                                        _http_bridge_turn_state_alias_key(
+                                            alias,
+                                            previous_session.key.api_key_id,
+                                        )
+                                    ] = previous_session.key
+                                continue
+                            if previous_key is not None:
                                 self._http_bridge_previous_response_index.pop(previous_alias_key, None)
                         if incoming_session_key is not None:
                             key = _HTTPBridgeSessionKey("session_header", incoming_session_key, api_key_id)
@@ -2920,6 +3088,11 @@ class ProxyService:
                         key=key,
                         incoming_turn_state=incoming_turn_state,
                         previous_response_id=previous_response_id,
+                    )
+                    and _http_bridge_session_matches_preferred_account(
+                        session=existing,
+                        previous_response_id=previous_response_id,
+                        preferred_account_id=preferred_account_id,
                     )
                 ):
                     current_instance = settings.http_responses_session_bridge_instance_id
@@ -2977,12 +3150,25 @@ class ProxyService:
                 )
                 if owner_check_required or key.affinity_kind == "prompt_cache":
                     owner_instance = _durable_bridge_lookup_active_owner(durable_lookup)
+                    hard_continuity_lookup = owner_check_required or previous_response_id is not None
                     ring_lookup_failed = False
                     if owner_instance is None:
                         try:
                             owner_instance = await _http_bridge_owner_instance(key, settings, self._ring_membership)
-                        except Exception:
+                        except Exception as exc:
                             ring_lookup_failed = True
+                            if hard_continuity_lookup:
+                                _record_continuity_fail_closed(
+                                    surface="http_bridge",
+                                    reason="owner_metadata_unavailable",
+                                    previous_response_id=previous_response_id,
+                                    session_id=incoming_turn_state or incoming_session_key,
+                                    upstream_error_code="owner_lookup_failed",
+                                )
+                                raise ProxyResponseError(
+                                    502,
+                                    _http_bridge_owner_lookup_unavailable_error_envelope(),
+                                ) from exc
                             if _http_bridge_can_local_recover_without_ring(
                                 key=key,
                                 headers=headers,
@@ -3000,7 +3186,19 @@ class ProxyService:
                         current_instance, ring = await _active_http_bridge_instance_ring(
                             settings, self._ring_membership
                         )
-                    except Exception:
+                    except Exception as exc:
+                        if hard_continuity_lookup:
+                            _record_continuity_fail_closed(
+                                surface="http_bridge",
+                                reason="owner_metadata_unavailable",
+                                previous_response_id=previous_response_id,
+                                session_id=incoming_turn_state or incoming_session_key,
+                                upstream_error_code="ring_lookup_failed",
+                            )
+                            raise ProxyResponseError(
+                                502,
+                                _http_bridge_owner_lookup_unavailable_error_envelope(),
+                            ) from exc
                         if ring_lookup_failed or _http_bridge_can_local_recover_without_ring(
                             key=key,
                             headers=headers,
@@ -3328,22 +3526,25 @@ class ProxyService:
                         and not allow_previous_response_recovery_rebind
                         and durable_lookup is None
                     ):
-                        continuity_error = ProxyResponseError(
-                            400,
-                            _http_bridge_previous_response_error_envelope(
-                                previous_response_id,
-                                (
-                                    "HTTP bridge continuity was lost. Replay x-codex-turn-state "
-                                    "or retry with a stable prompt_cache_key."
-                                ),
-                            ),
+                        _record_continuity_fail_closed(
+                            surface="http_bridge",
+                            reason="continuity_lost",
+                            previous_response_id=previous_response_id,
+                            session_id=incoming_turn_state or incoming_session_key,
                         )
+                        continuity_error = ProxyResponseError(502, _http_bridge_continuity_lost_error_envelope())
                     elif missing_turn_state_alias and inflight_future is None and durable_lookup is None:
                         turn_state_scope_conflict = incoming_turn_state is not None and any(
                             alias == incoming_turn_state and alias_api_key != api_key_id
                             for alias, alias_api_key in self._http_bridge_turn_state_index
                         )
                         if turn_state_scope_conflict:
+                            _record_continuity_fail_closed(
+                                surface="http_bridge",
+                                reason="turn_state_scope_conflict",
+                                previous_response_id=previous_response_id,
+                                session_id=incoming_turn_state,
+                            )
                             continuity_error = ProxyResponseError(
                                 409,
                                 openai_error(
@@ -3357,6 +3558,12 @@ class ProxyService:
                             and incoming_turn_state.startswith("http_turn_")
                             and not allow_forward_to_owner
                         ):
+                            _record_continuity_fail_closed(
+                                surface="http_bridge",
+                                reason="generated_turn_state_continuity_lost",
+                                previous_response_id=previous_response_id,
+                                session_id=incoming_turn_state,
+                            )
                             continuity_error = ProxyResponseError(
                                 409,
                                 openai_error(
@@ -3479,6 +3686,11 @@ class ProxyService:
                         incoming_turn_state=incoming_turn_state,
                         previous_response_id=previous_response_id,
                     )
+                    and _http_bridge_session_matches_preferred_account(
+                        session=session,
+                        previous_response_id=previous_response_id,
+                        preferred_account_id=preferred_account_id,
+                    )
                 ):
                     current_instance = settings.http_responses_session_bridge_instance_id
                     if _durable_bridge_lookup_allows_local_reuse(durable_lookup, current_instance=current_instance):
@@ -3498,6 +3710,7 @@ class ProxyService:
 
             created_session: _HTTPBridgeSession | None = None
             session_registered = False
+            require_preferred_account = previous_response_id is not None and preferred_account_id is not None
             try:
                 created_session = await self._create_http_bridge_session_compatible(
                     key,
@@ -3508,6 +3721,7 @@ class ProxyService:
                     idle_ttl_seconds=effective_idle_ttl_seconds,
                     request_stage=request_stage,
                     preferred_account_id=preferred_account_id,
+                    require_preferred_account=require_preferred_account,
                 )
                 await self._claim_durable_http_bridge_session(
                     created_session,
@@ -3871,6 +4085,7 @@ class ProxyService:
         idle_ttl_seconds: float,
         request_stage: str = "first_turn",
         preferred_account_id: str | None = None,
+        require_preferred_account: bool = False,
     ) -> "_HTTPBridgeSession":
         request_state = _WebSocketRequestState(
             request_id=f"http_bridge_connect_{uuid4().hex}",
@@ -3914,6 +4129,20 @@ class ProxyService:
                     openai_error(
                         selection.error_code or "no_accounts",
                         selection.error_message or "No active accounts available",
+                        error_type="server_error",
+                    ),
+                )
+            if require_preferred_account and preferred_account_id is not None and account.id != preferred_account_id:
+                message = "Previous response owner account is unavailable; retry later."
+                _record_same_account_takeover(
+                    preferred_account_id=preferred_account_id,
+                    selected_account_id=account.id,
+                )
+                raise ProxyResponseError(
+                    502,
+                    openai_error(
+                        "upstream_unavailable",
+                        message,
                         error_type="server_error",
                     ),
                 )
@@ -4706,6 +4935,7 @@ class ProxyService:
         previous_response_id: str | None,
         api_key: ApiKeyData | None,
         session_id: str | None = None,
+        surface: str,
     ) -> str | None:
         if previous_response_id is None:
             return None
@@ -4717,6 +4947,13 @@ class ProxyService:
         cache_key = (response_id, api_key_id, session_id_value)
         cached_account_id = self._websocket_previous_response_account_index.get(cache_key)
         if cached_account_id is not None:
+            _record_continuity_owner_resolution(
+                surface=surface,
+                source="request_cache",
+                outcome="hit",
+                previous_response_id=response_id,
+                session_id=session_id_value,
+            )
             return cached_account_id
         fallback_account_id = (
             self._websocket_previous_response_account_index.get((response_id, api_key_id, None))
@@ -4730,15 +4967,67 @@ class ProxyService:
                     api_key_id=api_key_id,
                     session_id=session_id_value,
                 )
-        except Exception:
-            logger.warning("Previous response owner lookup failed; continuing without owner pinning", exc_info=True)
-            return fallback_account_id
+        except Exception as exc:
+            if fallback_account_id is not None:
+                _record_continuity_owner_resolution(
+                    surface=surface,
+                    source="request_cache_fallback",
+                    outcome="hit",
+                    previous_response_id=response_id,
+                    session_id=session_id_value,
+                )
+                logger.warning(
+                    "Previous response owner lookup failed; using cached owner pin",
+                    exc_info=True,
+                )
+                return fallback_account_id
+            _record_continuity_owner_resolution(
+                surface=surface,
+                source="request_logs",
+                outcome="fail_closed",
+                previous_response_id=response_id,
+                session_id=session_id_value,
+            )
+            _record_continuity_fail_closed(
+                surface=surface,
+                reason="owner_lookup_failed",
+                previous_response_id=response_id,
+                session_id=session_id_value,
+            )
+            logger.warning("Previous response owner lookup failed; failing closed", exc_info=True)
+            raise ProxyResponseError(
+                502,
+                _previous_response_owner_lookup_failed_error_envelope(),
+            ) from exc
         if account_id is None:
+            if fallback_account_id is not None:
+                _record_continuity_owner_resolution(
+                    surface=surface,
+                    source="request_cache_fallback",
+                    outcome="hit",
+                    previous_response_id=response_id,
+                    session_id=session_id_value,
+                )
+            else:
+                _record_continuity_owner_resolution(
+                    surface=surface,
+                    source="request_logs",
+                    outcome="miss",
+                    previous_response_id=response_id,
+                    session_id=session_id_value,
+                )
             return fallback_account_id
         self._remember_websocket_previous_response_owner(
             previous_response_id=response_id,
             api_key_id=api_key_id,
             account_id=account_id,
+            session_id=session_id_value,
+        )
+        _record_continuity_owner_resolution(
+            surface=surface,
+            source="request_logs",
+            outcome="hit",
+            previous_response_id=response_id,
             session_id=session_id_value,
         )
         return account_id
@@ -5010,6 +5299,20 @@ class ProxyService:
                 payload=payload,
                 has_other_pending_requests=has_other_pending_requests,
             )
+        if (
+            retry_error_code in _WEBSOCKET_TRANSPARENT_REPLAY_ERROR_CODES
+            and request_state.previous_response_id is not None
+            and request_state.preferred_account_id is not None
+        ):
+            await self._handle_stream_error(
+                account,
+                {"message": _websocket_event_error_message(event_type, payload) or "Upstream error"},
+                retry_error_code,
+            )
+            event, payload, event_type, downstream_text = _rewrite_websocket_previous_response_owner_unavailable_event(
+                request_state=request_state,
+            )
+            retry_error_code = None
         if retry_error_code is not None:
             upstream_control.reconnect_requested = True
             if retry_is_previous_response_not_found:
@@ -5267,6 +5570,13 @@ class ProxyService:
         error_code: str,
         error_message: str,
     ) -> None:
+        status_code, payload, error_code, error_message = _sanitize_websocket_connect_failure(
+            request_state=request_state,
+            status_code=status_code,
+            payload=payload,
+            error_code=error_code,
+            error_message=error_message,
+        )
         await self._release_websocket_reservation(request_state.api_key_reservation)
         await self._write_websocket_connect_failure(
             account_id=account_id,
@@ -5275,6 +5585,9 @@ class ProxyService:
             error_code=error_code,
             error_message=error_message,
         )
+        response_create_gate = request_state.response_create_gate
+        if response_create_gate is not None:
+            _release_websocket_response_create_gate(request_state, response_create_gate)
         async with client_send_lock:
             await websocket.send_text(
                 _serialize_websocket_error_event(_wrapped_websocket_error_event(status_code, payload))
@@ -5402,6 +5715,9 @@ class ProxyService:
             response_id=request_state.response_id or request_state.request_id,
             error_param=error_param,
         )
+        response_create_gate = request_state.response_create_gate
+        if response_create_gate is not None:
+            _release_websocket_response_create_gate(request_state, response_create_gate)
         try:
             await self._send_downstream_websocket_text(
                 websocket,
@@ -5694,6 +6010,16 @@ class ProxyService:
         settlement = _StreamSettlement()
         last_transient_exc: ProxyResponseError | None = None
         excluded_account_ids: set[str] = set()
+        preferred_account_id: str | None = None
+        require_preferred_account = False
+        if payload.previous_response_id is not None:
+            preferred_account_id = await self._resolve_websocket_previous_response_owner(
+                previous_response_id=payload.previous_response_id,
+                api_key=api_key,
+                session_id=_owner_lookup_session_id_from_headers(headers),
+                surface="http_stream",
+            )
+            require_preferred_account = preferred_account_id is not None
         try:
             for attempt in range(max_attempts):
                 remaining_budget = _remaining_budget_seconds(deadline)
@@ -5731,6 +6057,7 @@ class ProxyService:
                         routing_strategy=routing_strategy,
                         model=payload.model,
                         exclude_account_ids=excluded_account_ids,
+                        preferred_account_id=preferred_account_id,
                     )
                 except ProxyResponseError as exc:
                     error = _parse_openai_error(exc.payload)
@@ -5762,6 +6089,36 @@ class ProxyService:
                     return
                 account = selection.account
                 if not account:
+                    if require_preferred_account and preferred_account_id is not None:
+                        message = "Previous response owner account is unavailable; retry later."
+                        _record_continuity_fail_closed(
+                            surface="http_stream",
+                            reason="owner_account_unavailable",
+                            previous_response_id=payload.previous_response_id,
+                            session_id=headers.get("x-codex-turn-state") or headers.get("session_id"),
+                            upstream_error_code="no_accounts",
+                        )
+                        event = response_failed_event(
+                            "upstream_unavailable",
+                            message,
+                            response_id=request_id,
+                        )
+                        yield format_sse_event(event)
+                        await self._write_request_log(
+                            account_id=preferred_account_id,
+                            api_key=api_key,
+                            request_id=request_id,
+                            model=payload.model,
+                            latency_ms=int((time.monotonic() - start) * 1000),
+                            status="error",
+                            error_code="upstream_unavailable",
+                            error_message=message,
+                            reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
+                            transport=request_transport,
+                            service_tier=payload.service_tier,
+                            requested_service_tier=payload.service_tier,
+                        )
+                        return
                     # If a prior attempt stored a transient 500 and the caller
                     # expects HTTP error propagation, re-raise the original error
                     # instead of returning a generic no_accounts event.
@@ -5792,6 +6149,40 @@ class ProxyService:
                     return
 
                 account_id_value = account.id
+                if (
+                    require_preferred_account
+                    and preferred_account_id is not None
+                    and account.id != preferred_account_id
+                ):
+                    message = "Previous response owner account is unavailable; retry later."
+                    _record_continuity_fail_closed(
+                        surface="http_stream",
+                        reason="owner_account_unavailable",
+                        previous_response_id=payload.previous_response_id,
+                        session_id=headers.get("x-codex-turn-state") or headers.get("session_id"),
+                        upstream_error_code="upstream_unavailable",
+                    )
+                    event = response_failed_event(
+                        "upstream_unavailable",
+                        message,
+                        response_id=request_id,
+                    )
+                    yield format_sse_event(event)
+                    await self._write_request_log(
+                        account_id=preferred_account_id,
+                        api_key=api_key,
+                        request_id=request_id,
+                        model=payload.model,
+                        latency_ms=int((time.monotonic() - start) * 1000),
+                        status="error",
+                        error_code="upstream_unavailable",
+                        error_message=message,
+                        reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
+                        transport=request_transport,
+                        service_tier=payload.service_tier,
+                        requested_service_tier=payload.service_tier,
+                    )
+                    return
                 try:
                     remaining_budget = _remaining_budget_seconds(deadline)
                     if remaining_budget <= 0:
@@ -5894,6 +6285,7 @@ class ProxyService:
                                 suppress_text_done_events=suppress_text_done_events,
                                 upstream_stream_transport=upstream_stream_transport,
                                 request_transport=request_transport,
+                                preferred_account_id=preferred_account_id,
                             ):
                                 yield line
                         except (_TransientStreamError, ProxyResponseError) as tex:
@@ -6219,6 +6611,7 @@ class ProxyService:
         suppress_text_done_events: bool,
         upstream_stream_transport: str | None,
         request_transport: str,
+        preferred_account_id: str | None = None,
     ) -> AsyncIterator[str]:
         account_id_value = account.id
         access_token = self._encryptor.decrypt(account.access_token_encrypted)
@@ -6277,22 +6670,52 @@ class ProxyService:
                     error = response.error if response else None
                 else:
                     error = event.error
+                response_id = (
+                    event.response.id
+                    if event.type == "response.failed" and event.response and event.response.id
+                    else request_id
+                )
                 code = _normalize_error_code(
                     error.code if error else None,
                     error.type if error else None,
                 )
+                rewritten_error = _rewrite_previous_response_stream_error(
+                    previous_response_id=payload.previous_response_id,
+                    preferred_account_id=preferred_account_id,
+                    error_code=code,
+                    error_type=error.type if error else None,
+                    error_message=error.message if error else None,
+                    error_param=error.param if error else None,
+                )
                 status = "error"
-                error_code = code
-                error_message = error.message if error else None
                 settlement.error = _upstream_error_from_openai(error)
                 settlement.record_success = False
-                settlement.account_health_error = _should_penalize_stream_error(code)
-                if allow_retry and _should_retry_stream_error(code):
-                    raise _RetryableStreamError(code, settlement.error)
-                if allow_transient_retry and code in _TRANSIENT_RETRY_CODES:
-                    raise _TransientStreamError(code, settlement.error)
+                if rewritten_error is not None:
+                    rewritten_code, rewritten_message, upstream_error_code = rewritten_error
+                    if upstream_error_code is not None:
+                        await self._handle_stream_error(
+                            account,
+                            settlement.error,
+                            upstream_error_code,
+                        )
+                    first, event, first_payload, event_type = _build_rewritten_stream_response_failed_event(
+                        response_id=response_id,
+                        error_code=rewritten_code,
+                        error_message=rewritten_message,
+                    )
+                    error_code = rewritten_code
+                    error_message = rewritten_message
+                    settlement.account_health_error = False
+                else:
+                    error_code = code
+                    error_message = error.message if error else None
+                    settlement.account_health_error = _should_penalize_stream_error(code)
+                    if allow_retry and _should_retry_stream_error(code):
+                        raise _RetryableStreamError(code, settlement.error)
+                    if allow_transient_retry and code in _TRANSIENT_RETRY_CODES:
+                        raise _TransientStreamError(code, settlement.error)
                 terminal_stream_error = _TerminalStreamError(
-                    code,
+                    error_code or code,
                     settlement.error,
                 )
                 if allow_retry:
@@ -6300,7 +6723,7 @@ class ProxyService:
                         "Not retrying non-recoverable stream failure request_id=%s account_id=%s code=%s",
                         request_id,
                         account_id_value,
-                        code,
+                        error_code or code,
                     )
 
             if event and event.type in ("response.completed", "response.incomplete"):
@@ -6347,14 +6770,47 @@ class ProxyService:
                             error = response.error if response else None
                         else:
                             error = event.error
-                        error_code = _normalize_error_code(
+                        raw_error_code = _normalize_error_code(
                             error.code if error else None,
                             error.type if error else None,
                         )
-                        error_message = error.message if error else None
-                        settlement.error = _upstream_error_from_openai(error)
-                        settlement.record_success = False
-                        settlement.account_health_error = _should_penalize_stream_error(error_code)
+                        rewritten_error = _rewrite_previous_response_stream_error(
+                            previous_response_id=payload.previous_response_id,
+                            preferred_account_id=preferred_account_id,
+                            error_code=raw_error_code,
+                            error_type=error.type if error else None,
+                            error_message=error.message if error else None,
+                            error_param=error.param if error else None,
+                        )
+                        if rewritten_error is not None:
+                            response_id = (
+                                event.response.id
+                                if event_type == "response.failed" and event.response and event.response.id
+                                else request_id
+                            )
+                            rewritten_code, rewritten_message, upstream_error_code = rewritten_error
+                            if upstream_error_code is not None:
+                                await self._handle_stream_error(
+                                    account,
+                                    _upstream_error_from_openai(error),
+                                    upstream_error_code,
+                                )
+                            line, event, event_payload, event_type = _build_rewritten_stream_response_failed_event(
+                                response_id=response_id,
+                                error_code=rewritten_code,
+                                error_message=rewritten_message,
+                            )
+                            error_code = rewritten_code
+                            error_message = rewritten_message
+                            settlement.error = _upstream_error_from_openai(error)
+                            settlement.record_success = False
+                            settlement.account_health_error = False
+                        else:
+                            error_code = raw_error_code
+                            error_message = error.message if error else None
+                            settlement.error = _upstream_error_from_openai(error)
+                            settlement.record_success = False
+                            settlement.account_health_error = _should_penalize_stream_error(error_code)
                     if event_type in ("response.completed", "response.incomplete"):
                         usage = event.response.usage if event.response else None
                         if event_type == "response.incomplete":
@@ -6365,6 +6821,36 @@ class ProxyService:
         except ProxyResponseError as exc:
             response_create_lease.release()
             error = _parse_openai_error(exc.payload)
+            rewritten_error = _rewrite_previous_response_stream_error(
+                previous_response_id=payload.previous_response_id,
+                preferred_account_id=preferred_account_id,
+                error_code=_normalize_error_code(
+                    error.code if error else None,
+                    error.type if error else None,
+                ),
+                error_type=error.type if error else None,
+                error_message=error.message if error else None,
+                error_param=error.param if error else None,
+            )
+            if rewritten_error is not None:
+                rewritten_code, rewritten_message, upstream_error_code = rewritten_error
+                if upstream_error_code is not None:
+                    await self._handle_stream_error(
+                        account,
+                        _upstream_error_from_openai(error),
+                        upstream_error_code,
+                    )
+                status = "error"
+                error_code = rewritten_code
+                error_message = rewritten_message
+                settlement.record_success = False
+                settlement.account_health_error = False
+                yield _build_rewritten_stream_response_failed_event(
+                    response_id=request_id,
+                    error_code=rewritten_code,
+                    error_message=rewritten_message,
+                )[0]
+                return
             status = "error"
             error_code = _normalize_error_code(
                 error.code if error else None,
@@ -6916,6 +7402,7 @@ class _WebSocketRequestState:
     error_param_override: str | None = None
     error_http_status_override: int | None = None
     response_create_gate_acquired: bool = False
+    response_create_gate: asyncio.Semaphore | None = None
     response_create_admission: AdmissionLease | None = None
     affinity_policy: _AffinityPolicy = field(default_factory=_AffinityPolicy)
 
@@ -7331,6 +7818,13 @@ def _maybe_rewrite_websocket_previous_response_not_found_event(
         return event, payload, event_type, original_text
 
     upstream_control.reconnect_requested = True
+    _record_continuity_fail_closed(
+        surface="websocket_stream",
+        reason="previous_response_not_found",
+        previous_response_id=request_state.previous_response_id,
+        session_id=request_state.session_id,
+        upstream_error_code=error_code,
+    )
     rewritten_event_payload = response_failed_event(
         "stream_incomplete",
         "Upstream websocket closed before response.completed",
@@ -7343,6 +7837,136 @@ def _maybe_rewrite_websocket_previous_response_not_found_event(
     rewritten_event = parse_sse_event(rewritten_event_block)
     rewritten_event_type = _event_type_from_payload(rewritten_event, rewritten_payload)
     return rewritten_event, rewritten_payload, rewritten_event_type, rewritten_text
+
+
+def _rewrite_websocket_previous_response_owner_unavailable_event(
+    *,
+    request_state: _WebSocketRequestState,
+) -> tuple[OpenAIEvent | None, dict[str, JsonValue] | None, str | None, str]:
+    _record_continuity_fail_closed(
+        surface="websocket_stream",
+        reason="owner_account_unavailable",
+        previous_response_id=request_state.previous_response_id,
+        session_id=request_state.session_id,
+    )
+    rewritten_event_payload = response_failed_event(
+        "upstream_unavailable",
+        "Previous response owner account is unavailable; retry later.",
+        error_type="server_error",
+        response_id=request_state.response_id or request_state.request_id,
+    )
+    rewritten_text = json.dumps(rewritten_event_payload, ensure_ascii=True, separators=(",", ":"))
+    rewritten_event_block = format_sse_event(rewritten_event_payload)
+    rewritten_payload = parse_sse_data_json(rewritten_event_block)
+    rewritten_event = parse_sse_event(rewritten_event_block)
+    rewritten_event_type = _event_type_from_payload(rewritten_event, rewritten_payload)
+    return rewritten_event, rewritten_payload, rewritten_event_type, rewritten_text
+
+
+def _sanitize_websocket_connect_failure(
+    *,
+    request_state: _WebSocketRequestState,
+    status_code: int,
+    payload: OpenAIErrorEnvelope,
+    error_code: str,
+    error_message: str,
+) -> tuple[int, OpenAIErrorEnvelope, str, str]:
+    if request_state.previous_response_id is None:
+        return status_code, payload, error_code, error_message
+
+    parsed_error = _parse_openai_error(payload)
+    normalized_code = _normalize_error_code(
+        parsed_error.code if parsed_error else error_code,
+        parsed_error.type if parsed_error else None,
+    )
+    normalized_message = parsed_error.message if parsed_error and parsed_error.message else error_message
+    if not _is_previous_response_not_found_error(
+        code=normalized_code,
+        param=parsed_error.param if parsed_error else None,
+        message=normalized_message,
+    ):
+        return status_code, payload, error_code, error_message
+
+    rewritten_message = "Upstream websocket closed before response.completed"
+    _record_continuity_fail_closed(
+        surface="websocket_connect",
+        reason="previous_response_not_found",
+        previous_response_id=request_state.previous_response_id,
+        session_id=request_state.session_id,
+        upstream_error_code=normalized_code,
+    )
+    return (
+        502,
+        openai_error(
+            "stream_incomplete",
+            rewritten_message,
+            error_type="server_error",
+        ),
+        "stream_incomplete",
+        rewritten_message,
+    )
+
+
+def _rewrite_previous_response_stream_error(
+    *,
+    previous_response_id: str | None,
+    preferred_account_id: str | None,
+    error_code: str | None,
+    error_type: str | None,
+    error_message: str | None,
+    error_param: str | None,
+) -> tuple[str, str, str | None] | None:
+    if previous_response_id is None:
+        return None
+    if _is_previous_response_not_found_error(
+        code=error_code,
+        param=error_param,
+        message=error_message,
+    ):
+        _record_continuity_fail_closed(
+            surface="http_stream",
+            reason="previous_response_not_found",
+            previous_response_id=previous_response_id,
+            upstream_error_code=error_code,
+        )
+        return (
+            "stream_incomplete",
+            "Upstream websocket closed before response.completed",
+            None,
+        )
+    normalized_code = _normalize_error_code(error_code, error_type)
+    if preferred_account_id is not None and normalized_code in _ACCOUNT_RECOVERY_RETRY_CODES:
+        _record_continuity_fail_closed(
+            surface="http_stream",
+            reason="owner_account_unavailable",
+            previous_response_id=previous_response_id,
+            upstream_error_code=normalized_code,
+        )
+        return (
+            "upstream_unavailable",
+            "Previous response owner account is unavailable; retry later.",
+            normalized_code,
+        )
+    return None
+
+
+def _build_rewritten_stream_response_failed_event(
+    *,
+    response_id: str,
+    error_code: str,
+    error_message: str,
+) -> tuple[str, OpenAIEvent | None, dict[str, JsonValue] | None, str | None]:
+    rewritten_event_payload = response_failed_event(
+        error_code,
+        error_message,
+        error_type="server_error",
+        response_id=response_id,
+    )
+    rewritten_event_block = format_sse_event(rewritten_event_payload)
+    rewritten_payload = parse_sse_data_json(rewritten_event_block)
+    rewritten_event = parse_sse_event(rewritten_event_block)
+    rewritten_event_type = _event_type_from_payload(rewritten_event, rewritten_payload)
+    return rewritten_event_block, rewritten_event, rewritten_payload, rewritten_event_type
 
 
 def _find_websocket_request_state_by_response_id(
@@ -7379,6 +8003,7 @@ def _release_websocket_response_create_gate(
         request_state.response_create_admission.release()
         request_state.response_create_admission = None
     request_state.awaiting_response_created = False
+    request_state.response_create_gate = None
     if not request_state.response_create_gate_acquired:
         return
     request_state.response_create_gate_acquired = False
@@ -8081,6 +8706,65 @@ def _maybe_log_proxy_service_tier_trace(
     )
 
 
+def _hash_identifier_or_none(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    return _hash_identifier(stripped)
+
+
+def _record_continuity_owner_resolution(
+    *,
+    surface: str,
+    source: str,
+    outcome: str,
+    previous_response_id: str | None,
+    session_id: str | None,
+) -> None:
+    if PROMETHEUS_AVAILABLE and continuity_owner_resolution_total is not None:
+        continuity_owner_resolution_total.labels(
+            surface=surface,
+            source=source,
+            outcome=outcome,
+        ).inc()
+    if outcome == "miss" or (outcome == "hit" and source == "request_cache"):
+        return
+    logger.log(
+        logging.WARNING if outcome == "fail_closed" else logging.INFO,
+        "continuity_owner_resolution surface=%s source=%s outcome=%s previous_response_id=%s session_id=%s",
+        surface,
+        source,
+        outcome,
+        _hash_identifier_or_none(previous_response_id),
+        _hash_identifier_or_none(session_id),
+    )
+
+
+def _record_continuity_fail_closed(
+    *,
+    surface: str,
+    reason: str,
+    previous_response_id: str | None,
+    session_id: str | None = None,
+    upstream_error_code: str | None = None,
+) -> None:
+    if PROMETHEUS_AVAILABLE and continuity_fail_closed_total is not None:
+        continuity_fail_closed_total.labels(
+            surface=surface,
+            reason=reason,
+        ).inc()
+    logger.warning(
+        "continuity_fail_closed surface=%s reason=%s previous_response_id=%s session_id=%s upstream_error_code=%s",
+        surface,
+        reason,
+        _hash_identifier_or_none(previous_response_id),
+        _hash_identifier_or_none(session_id),
+        upstream_error_code,
+    )
+
+
 def _hash_identifier(value: str) -> str:
     digest = sha256(value.encode("utf-8")).hexdigest()
     return f"sha256:{digest[:12]}"
@@ -8377,6 +9061,17 @@ def _http_bridge_session_reusable_for_request(
     if previous_response_id is not None:
         return True
     return not session.codex_session
+
+
+def _http_bridge_session_matches_preferred_account(
+    *,
+    session: "_HTTPBridgeSession",
+    previous_response_id: str | None,
+    preferred_account_id: str | None,
+) -> bool:
+    if previous_response_id is None or preferred_account_id is None:
+        return True
+    return session.account.id == preferred_account_id
 
 
 def _resolve_prompt_cache_key(
@@ -8778,6 +9473,30 @@ def _http_bridge_previous_response_error_envelope(
     )
     payload["error"]["param"] = "previous_response_id"
     return payload
+
+
+def _http_bridge_continuity_lost_error_envelope() -> OpenAIErrorEnvelope:
+    return openai_error(
+        "stream_incomplete",
+        "Upstream websocket closed before response.completed",
+        error_type="server_error",
+    )
+
+
+def _http_bridge_owner_lookup_unavailable_error_envelope() -> OpenAIErrorEnvelope:
+    return openai_error(
+        "upstream_unavailable",
+        "HTTP bridge owner metadata unavailable; retry later.",
+        error_type="server_error",
+    )
+
+
+def _previous_response_owner_lookup_failed_error_envelope() -> OpenAIErrorEnvelope:
+    return openai_error(
+        "upstream_unavailable",
+        "Previous response owner lookup failed; retry later.",
+        error_type="server_error",
+    )
 
 
 def _mark_request_state_previous_response_not_found(
