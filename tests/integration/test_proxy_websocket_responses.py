@@ -1227,22 +1227,6 @@ def test_v1_responses_websocket_masks_previous_response_not_found_and_recovers_o
                     }
                 )
             )
-            failed_retryable = json.loads(websocket.receive_text())
-            assert failed_retryable["type"] == "response.failed"
-            assert failed_retryable["response"]["error"]["code"] == "stream_incomplete"
-            assert "previous_response_not_found" not in json.dumps(failed_retryable)
-
-            websocket.send_text(
-                json.dumps(
-                    {
-                        "type": "response.create",
-                        "model": "gpt-5.4",
-                        "input": "continue-retry",
-                        "previous_response_id": "resp_ws_prev_anchor",
-                        "stream": True,
-                    }
-                )
-            )
             created_2 = json.loads(websocket.receive_text())
             completed_2 = json.loads(websocket.receive_text())
 
@@ -1399,22 +1383,6 @@ def test_v1_responses_websocket_masks_invalid_request_previous_response_not_foun
                         "type": "response.create",
                         "model": "gpt-5.4",
                         "input": "continue",
-                        "previous_response_id": "resp_ws_prev_anchor",
-                        "stream": True,
-                    }
-                )
-            )
-            failed_retryable = json.loads(websocket.receive_text())
-            assert failed_retryable["type"] == "response.failed"
-            assert failed_retryable["response"]["error"]["code"] == "stream_incomplete"
-            assert "previous_response_not_found" not in json.dumps(failed_retryable)
-
-            websocket.send_text(
-                json.dumps(
-                    {
-                        "type": "response.create",
-                        "model": "gpt-5.4",
-                        "input": "continue-retry",
                         "previous_response_id": "resp_ws_prev_anchor",
                         "stream": True,
                     }
