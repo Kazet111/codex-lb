@@ -13,7 +13,7 @@ import app.core.clients.proxy as proxy_client_module
 import app.modules.proxy.service as proxy_module
 from app.core.auth import generate_unique_account_id
 from app.core.config.settings import Settings
-from app.db.models import DashboardSettings, RequestLog
+from app.db.models import Account, DashboardSettings, RequestLog
 from app.db.session import SessionLocal
 from app.modules.request_logs.repository import RequestLogsRepository
 
@@ -337,6 +337,109 @@ async def test_v1_responses_previous_response_owner_lookup_failure_without_http_
     assert response.status_code == 502
     assert response.json()["error"]["code"] == "upstream_unavailable"
     assert response.json()["error"]["message"] == "Previous response owner lookup failed; retry later."
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_previous_response_followup_without_http_bridge_recovers_owner_from_request_logs(
+    async_client,
+    monkeypatch,
+):
+    owner_email = "prev-http-owner-anchor@example.com"
+    owner_raw_account_id = "acc_prev_http_owner_anchor"
+    owner_auth_json = _make_auth_json(owner_raw_account_id, owner_email)
+    owner_files = {"auth_json": ("auth.json", json.dumps(owner_auth_json), "application/json")}
+    response = await async_client.post("/api/accounts/import", files=owner_files)
+    assert response.status_code == 200
+
+    other_email = "prev-http-other-anchor@example.com"
+    other_raw_account_id = "acc_prev_http_other_anchor"
+    other_auth_json = _make_auth_json(other_raw_account_id, other_email)
+    other_files = {"auth_json": ("auth.json", json.dumps(other_auth_json), "application/json")}
+    response = await async_client.post("/api/accounts/import", files=other_files)
+    assert response.status_code == 200
+
+    async with SessionLocal() as session:
+        accounts = {
+            account.chatgpt_account_id: account
+            for account in (await session.execute(select(Account))).scalars().all()
+            if account.chatgpt_account_id in {owner_raw_account_id, other_raw_account_id}
+        }
+
+    owner_account = accounts[owner_raw_account_id]
+    other_account = accounts[other_raw_account_id]
+    selection_preferred_ids: list[str | None] = []
+
+    async def fake_select_account(self, deadline: float, **kwargs):
+        del self, deadline
+        preferred_account_id = cast(str | None, kwargs.get("preferred_account_id"))
+        selection_preferred_ids.append(preferred_account_id)
+        if not selection_preferred_ids[:-1]:
+            return proxy_module.AccountSelection(account=owner_account, error_message=None, error_code=None)
+        if preferred_account_id == owner_account.id:
+            return proxy_module.AccountSelection(account=owner_account, error_message=None, error_code=None)
+        return proxy_module.AccountSelection(account=other_account, error_message=None, error_code=None)
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **kwargs):
+        del headers, access_token, base_url, raise_for_status, kwargs
+        if payload.previous_response_id is None:
+            assert account_id == owner_raw_account_id
+            yield (
+                'data: {"type":"response.completed","response":{"id":"resp_prev_http_anchor",'
+                '"object":"response","status":"completed","usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}\n\n'
+            )
+            return
+        if payload.previous_response_id == "resp_prev_http_anchor" and account_id == owner_raw_account_id:
+            yield (
+                'data: {"type":"response.completed","response":{"id":"resp_prev_http_followup",'
+                '"object":"response","status":"completed","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}\n\n'
+            )
+            return
+        error_payload = proxy_module.openai_error(
+            "previous_response_not_found",
+            "Previous response with id 'resp_prev_http_anchor' not found.",
+            error_type="invalid_request_error",
+        )
+        error_payload["error"]["param"] = "previous_response_id"
+        raise proxy_module.ProxyResponseError(400, error_payload)
+        if False:
+            yield ""
+
+    async def fake_ensure_fresh(self, account, **kwargs):
+        del self, kwargs
+        return account
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget_compatible", fake_select_account)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh)
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    first_response = await async_client.post(
+        "/v1/responses",
+        json={"model": "gpt-5.1", "input": "start"},
+        headers={"session_id": "sid_prev_http_anchor"},
+    )
+
+    assert first_response.status_code == 200
+    assert first_response.json()["id"] == "resp_prev_http_anchor"
+    async with SessionLocal() as session:
+        persisted_log = (
+            await session.execute(select(RequestLog).where(RequestLog.request_id == "resp_prev_http_anchor").limit(1))
+        ).scalar_one_or_none()
+    assert persisted_log is not None
+    assert persisted_log.session_id == "sid_prev_http_anchor"
+
+    second_response = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.1",
+            "input": "continue",
+            "previous_response_id": "resp_prev_http_anchor",
+        },
+        headers={"session_id": "sid_prev_http_anchor"},
+    )
+
+    assert second_response.status_code == 200
+    assert second_response.json()["id"] == "resp_prev_http_followup"
+    assert selection_preferred_ids == [None, owner_account.id]
 
 
 @pytest.mark.asyncio
@@ -671,7 +774,7 @@ async def test_proxy_responses_streams_upstream(async_client, monkeypatch):
         )
         log = result.scalars().first()
         assert log is not None
-        assert log.request_id == request_id
+        assert log.request_id == "resp_1"
         assert log.transport == "http"
 
 

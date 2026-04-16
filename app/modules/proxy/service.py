@@ -6621,10 +6621,12 @@ class ProxyService:
         service_tier = requested_service_tier
         actual_service_tier: str | None = None
         reasoning_effort = payload.reasoning.effort if payload.reasoning else None
+        session_id = _owner_lookup_session_id_from_headers(headers)
         start = time.monotonic()
         status = "success"
         error_code = None
         error_message = None
+        response_id = request_id
         usage = None
         saw_text_delta = False
         latency_first_token_ms: int | None = None
@@ -6728,6 +6730,8 @@ class ProxyService:
 
             if event and event.type in ("response.completed", "response.incomplete"):
                 usage = event.response.usage if event.response else None
+                if event.response and event.response.id:
+                    response_id = event.response.id
                 if event.type == "response.incomplete":
                     status = "error"
 
@@ -6768,6 +6772,8 @@ class ProxyService:
                         if event_type == "response.failed":
                             response = event.response
                             error = response.error if response else None
+                            if response and response.id:
+                                response_id = response.id
                         else:
                             error = event.error
                         raw_error_code = _normalize_error_code(
@@ -6812,7 +6818,10 @@ class ProxyService:
                             settlement.record_success = False
                             settlement.account_health_error = _should_penalize_stream_error(error_code)
                     if event_type in ("response.completed", "response.incomplete"):
-                        usage = event.response.usage if event is not None and event.response else None
+                        response = event.response if event is not None else None
+                        usage = response.usage if response else None
+                        if response and response.id:
+                            response_id = response.id
                         if event_type == "response.incomplete":
                             status = "error"
                 if latency_first_token_ms is None and event_type in _TEXT_DELTA_EVENT_TYPES:
@@ -6881,7 +6890,7 @@ class ProxyService:
             await self._write_request_log(
                 account_id=account_id_value,
                 api_key=api_key,
-                request_id=request_id,
+                request_id=response_id,
                 model=model,
                 latency_ms=int((time.monotonic() - start) * 1000),
                 status=status,
@@ -6897,6 +6906,7 @@ class ProxyService:
                 requested_service_tier=requested_service_tier,
                 actual_service_tier=actual_service_tier,
                 latency_first_token_ms=latency_first_token_ms,
+                session_id=session_id,
             )
             _maybe_log_proxy_service_tier_trace(
                 "stream",
