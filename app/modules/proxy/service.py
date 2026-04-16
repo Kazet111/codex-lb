@@ -519,6 +519,8 @@ class ProxyService:
             api_key_reservation=api_key_reservation,
             request_id=request_id,
         )
+        if downstream_turn_state is not None:
+            request_state.session_id = _normalize_session_id(downstream_turn_state)
         request_state.transport = _REQUEST_TRANSPORT_HTTP
         request_state.request_stage = _http_bridge_request_stage(
             headers=headers,
@@ -545,7 +547,7 @@ class ProxyService:
             request_state.preferred_account_id = await self._resolve_websocket_previous_response_owner(
                 previous_response_id=request_state.previous_response_id,
                 api_key=api_key,
-                session_id=_owner_lookup_session_id_from_headers(headers),
+                session_id=request_state.session_id,
             )
         session_or_forward = await self._get_or_create_http_bridge_session(
             bridge_session_key,
@@ -835,6 +837,8 @@ class ProxyService:
                     api_key_reservation=retry_api_key_reservation,
                     request_id=request_id,
                 )
+                if downstream_turn_state is not None:
+                    retry_request_state.session_id = _normalize_session_id(downstream_turn_state)
                 retry_request_state.transport = _REQUEST_TRANSPORT_HTTP
                 retry_request_state.request_stage = retry_request_stage
                 retry_request_state.preferred_account_id = retry_preferred_account_id
@@ -4714,10 +4718,11 @@ class ProxyService:
         cached_account_id = self._websocket_previous_response_account_index.get(cache_key)
         if cached_account_id is not None:
             return cached_account_id
-        if session_id_value is not None:
-            fallback_account_id = self._websocket_previous_response_account_index.get((response_id, api_key_id, None))
-            if fallback_account_id is not None:
-                return fallback_account_id
+        fallback_account_id = (
+            self._websocket_previous_response_account_index.get((response_id, api_key_id, None))
+            if session_id_value is not None
+            else None
+        )
         try:
             async with self._repo_factory() as repos:
                 account_id = await repos.request_logs.find_latest_account_id_for_response_id(
@@ -4727,9 +4732,9 @@ class ProxyService:
                 )
         except Exception:
             logger.warning("Previous response owner lookup failed; continuing without owner pinning", exc_info=True)
-            return None
+            return fallback_account_id
         if account_id is None:
-            return None
+            return fallback_account_id
         self._remember_websocket_previous_response_owner(
             previous_response_id=response_id,
             api_key_id=api_key_id,

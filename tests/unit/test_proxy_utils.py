@@ -5825,7 +5825,44 @@ async def test_resolve_websocket_previous_response_owner_miss_does_not_evict_kno
     )
 
     assert owner == "acc_owner"
-    assert request_logs.lookup_calls == []
+    assert request_logs.lookup_calls == [("resp_prev_shared", api_key.id, "req_terminal_a")]
+
+
+@pytest.mark.asyncio
+async def test_resolve_websocket_previous_response_owner_prefers_scoped_lookup_over_generic_cache() -> None:
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    api_key = ApiKeyData(
+        id="key_shared",
+        name="shared-key",
+        key_prefix="sk-shared",
+        allowed_models=None,
+        enforced_model=None,
+        enforced_reasoning_effort=None,
+        enforced_service_tier=None,
+        expires_at=None,
+        is_active=True,
+        created_at=utcnow(),
+        last_used_at=None,
+    )
+    service._remember_websocket_previous_response_owner(
+        previous_response_id="resp_prev_shared",
+        api_key_id=api_key.id,
+        account_id="acc_owner_generic",
+    )
+    request_logs.response_owner_by_id[("resp_prev_shared", api_key.id, "turn_scope_a")] = "acc_owner_scoped"
+
+    owner = await service._resolve_websocket_previous_response_owner(
+        previous_response_id="resp_prev_shared",
+        api_key=api_key,
+        session_id="turn_scope_a",
+    )
+
+    assert owner == "acc_owner_scoped"
+    assert request_logs.lookup_calls == [("resp_prev_shared", api_key.id, "turn_scope_a")]
+    assert service._websocket_previous_response_account_index[("resp_prev_shared", api_key.id, "turn_scope_a")] == (
+        "acc_owner_scoped"
+    )
 
 
 def test_remember_websocket_previous_response_owner_eviction_keeps_latest_entries():

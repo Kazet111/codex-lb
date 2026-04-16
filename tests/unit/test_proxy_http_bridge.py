@@ -1828,6 +1828,7 @@ async def test_stream_via_http_bridge_resolves_previous_response_owner_from_requ
         event_queue=asyncio.Queue(),
         transport="http",
         previous_response_id="resp_prev_owner_lookup",
+        session_id="turn_http_owner",
     )
     event_queue = request_state.event_queue
     assert event_queue is not None
@@ -1920,6 +1921,128 @@ async def test_stream_via_http_bridge_resolves_previous_response_owner_from_requ
         session_id="turn_http_owner",
     )
     assert captured_preferred["value"] == "acc-owner-from-logs"
+
+
+@pytest.mark.asyncio
+async def test_stream_via_http_bridge_uses_generated_downstream_turn_state_for_owner_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    payload = proxy_service.ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.4",
+            "instructions": "hi",
+            "input": "hello",
+            "previous_response_id": "resp_prev_owner_lookup",
+        }
+    )
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-generated-turn-state",
+        model="gpt-5.4",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+        event_queue=asyncio.Queue(),
+        transport="http",
+        previous_response_id="resp_prev_owner_lookup",
+        session_id="sid-shared",
+    )
+    session = proxy_service._HTTPBridgeSession(
+        key=proxy_service._HTTPBridgeSessionKey("session_header", "sid-shared", None),
+        headers={"x-codex-session-id": "sid-shared"},
+        affinity=proxy_service._AffinityPolicy(
+            key="sid-shared",
+            kind=proxy_service.StickySessionKind.CODEX_SESSION,
+        ),
+        request_model="gpt-5.4",
+        account=cast(Any, SimpleNamespace(id="acc-1", status=AccountStatus.ACTIVE)),
+        upstream=cast(UpstreamResponsesWebSocket, SimpleNamespace(close=AsyncMock())),
+        upstream_control=proxy_service._WebSocketUpstreamControl(),
+        pending_requests=deque(),
+        pending_lock=anyio.Lock(),
+        response_create_gate=asyncio.Semaphore(1),
+        queued_request_count=0,
+        last_used_at=1.0,
+        idle_ttl_seconds=120.0,
+    )
+
+    def fake_prepare(
+        _prepared_payload: proxy_service.ResponsesRequest,
+        _headers: dict[str, str] | Any,
+        *,
+        api_key: proxy_service.ApiKeyData | None,
+        api_key_reservation: proxy_service.ApiKeyUsageReservationData | None,
+        request_id: str,
+    ) -> tuple[proxy_service._WebSocketRequestState, str]:
+        del api_key, api_key_reservation, request_id
+        return request_state, '{"type":"response.create"}'
+
+    async def fake_stream_http_bridge_session_events(
+        _session: proxy_service._HTTPBridgeSession,
+        *,
+        request_state: proxy_service._WebSocketRequestState,
+        text_data: str,
+        queue_limit: int,
+        propagate_http_errors: bool,
+        downstream_turn_state: str | None,
+    ):
+        del request_state, text_data, queue_limit, propagate_http_errors, downstream_turn_state
+        yield 'data: {"type":"response.completed"}\n\n'
+
+    owner_lookup = AsyncMock(return_value="acc-owner-from-turn-state")
+
+    monkeypatch.setattr(
+        proxy_service,
+        "get_settings_cache",
+        lambda: cast(
+            Any,
+            SimpleNamespace(
+                get=AsyncMock(
+                    return_value=SimpleNamespace(
+                        sticky_threads_enabled=False,
+                        openai_cache_affinity_max_age_seconds=1800,
+                        http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
+                        http_responses_session_bridge_gateway_safe_mode=False,
+                    )
+                )
+            ),
+        ),
+    )
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    monkeypatch.setattr(service._durable_bridge, "lookup_request_targets", AsyncMock(return_value=None))
+    monkeypatch.setattr(service, "_prepare_http_bridge_request", fake_prepare)
+    monkeypatch.setattr(service, "_resolve_websocket_previous_response_owner", owner_lookup)
+    monkeypatch.setattr(service, "_get_or_create_http_bridge_session", AsyncMock(return_value=session))
+    monkeypatch.setattr(service, "_stream_http_bridge_session_events", fake_stream_http_bridge_session_events)
+
+    chunks = [
+        chunk
+        async for chunk in service._stream_via_http_bridge(
+            payload,
+            headers={"x-codex-session-id": "sid-shared"},
+            codex_session_affinity=True,
+            propagate_http_errors=False,
+            openai_cache_affinity=False,
+            api_key=None,
+            api_key_reservation=None,
+            suppress_text_done_events=False,
+            idle_ttl_seconds=120.0,
+            codex_idle_ttl_seconds=1800.0,
+            max_sessions=8,
+            queue_limit=4,
+            downstream_turn_state="http_turn_generated",
+        )
+    ]
+
+    assert chunks == ['data: {"type":"response.completed"}\n\n']
+    owner_lookup.assert_awaited_once_with(
+        previous_response_id="resp_prev_owner_lookup",
+        api_key=None,
+        session_id="http_turn_generated",
+    )
+    assert request_state.session_id == "http_turn_generated"
+    assert request_state.preferred_account_id == "acc-owner-from-turn-state"
 
 
 @pytest.mark.asyncio
