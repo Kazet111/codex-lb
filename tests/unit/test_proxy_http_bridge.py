@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 
 import anyio
 import pytest
+from fastapi import WebSocket
 
 from app.core.clients.proxy import ProxyResponseError
 from app.core.clients.proxy_websocket import UpstreamResponsesWebSocket
@@ -3464,7 +3465,9 @@ async def test_get_or_create_http_bridge_session_recovers_locally_when_owner_end
 
     assert resolved is created_session
     claim_durable.assert_awaited_once()
-    assert claim_durable.await_args.kwargs["allow_takeover"] is True
+    await_args = claim_durable.await_args
+    assert await_args is not None
+    assert await_args.kwargs["allow_takeover"] is True
     service._ring_membership.resolve_endpoint.assert_awaited_once_with("instance-b")
 
 
@@ -3529,7 +3532,9 @@ async def test_get_or_create_http_bridge_session_recovers_locally_when_owner_end
 
     assert resolved is created_session
     claim_durable.assert_awaited_once()
-    assert claim_durable.await_args.kwargs["allow_takeover"] is True
+    await_args = claim_durable.await_args
+    assert await_args is not None
+    assert await_args.kwargs["allow_takeover"] is True
 
 
 @pytest.mark.asyncio
@@ -3592,7 +3597,9 @@ async def test_get_or_create_http_bridge_session_recovers_locally_without_anchor
 
     assert resolved is created_session
     claim_durable.assert_awaited_once()
-    assert claim_durable.await_args.kwargs["allow_takeover"] is True
+    await_args = claim_durable.await_args
+    assert await_args is not None
+    assert await_args.kwargs["allow_takeover"] is True
 
 
 @pytest.mark.asyncio
@@ -3655,7 +3662,9 @@ async def test_get_or_create_http_bridge_session_prompt_cache_takes_over_stale_s
 
     assert resolved is created_session
     claim_durable.assert_awaited_once()
-    assert claim_durable.await_args.kwargs["allow_takeover"] is True
+    await_args = claim_durable.await_args
+    assert await_args is not None
+    assert await_args.kwargs["allow_takeover"] is True
 
 
 @pytest.mark.asyncio
@@ -3900,7 +3909,7 @@ async def test_close_all_http_bridge_sessions_fails_capacity_waiters_instead_of_
         account=cast(Any, SimpleNamespace(id="acc-existing", status=AccountStatus.ACTIVE)),
         upstream=cast(UpstreamResponsesWebSocket, SimpleNamespace(close=AsyncMock())),
         upstream_control=proxy_service._WebSocketUpstreamControl(),
-        pending_requests=deque([object()]),
+        pending_requests=cast(deque[proxy_service._WebSocketRequestState], deque()),
         pending_lock=anyio.Lock(),
         response_create_gate=asyncio.Semaphore(1),
         queued_request_count=1,
@@ -4505,8 +4514,10 @@ async def test_http_bridge_reader_unexpected_processing_error_fails_pending_requ
         event_queue=asyncio.Queue(),
         transport="http",
     )
-    await asyncio.wait_for(request_state.event_queue.put("seed"), timeout=0.1)
-    await asyncio.wait_for(request_state.event_queue.get(), timeout=0.1)
+    event_queue = request_state.event_queue
+    assert event_queue is not None
+    await asyncio.wait_for(event_queue.put("seed"), timeout=0.1)
+    await asyncio.wait_for(event_queue.get(), timeout=0.1)
     gate = asyncio.Semaphore(1)
     await gate.acquire()
     request_state.response_create_gate_acquired = True
@@ -4540,9 +4551,8 @@ async def test_http_bridge_reader_unexpected_processing_error_fails_pending_requ
 
     await service._relay_http_bridge_upstream_messages(session)
 
-    event_queue = request_state.event_queue
-    assert event_queue is not None
     failed_event = await asyncio.wait_for(event_queue.get(), timeout=0.1)
+    assert failed_event is not None
     assert '"code":"stream_incomplete"' in failed_event
     assert "reader" in failed_event
     assert await asyncio.wait_for(event_queue.get(), timeout=0.1) is None
@@ -4570,7 +4580,11 @@ async def test_websocket_reader_unexpected_processing_error_fails_pending_reques
     request_state.response_create_gate_acquired = True
     pending_requests: deque[proxy_service._WebSocketRequestState] = deque([request_state])
     pending_lock = anyio.Lock()
-    websocket = SimpleNamespace(send_text=AsyncMock(), send_bytes=AsyncMock(), close=AsyncMock())
+    send_text = AsyncMock()
+    websocket = cast(
+        WebSocket,
+        SimpleNamespace(send_text=send_text, send_bytes=AsyncMock(), close=AsyncMock()),
+    )
     upstream = cast(
         UpstreamResponsesWebSocket,
         SimpleNamespace(
@@ -4600,8 +4614,8 @@ async def test_websocket_reader_unexpected_processing_error_fails_pending_reques
         downstream_activity=proxy_service._DownstreamWebSocketActivity(),
     )
 
-    websocket.send_text.assert_awaited()
-    terminal_payload = websocket.send_text.await_args_list[0].args[0]
+    send_text.assert_awaited()
+    terminal_payload = send_text.await_args_list[0].args[0]
     assert '"code":"stream_incomplete"' in terminal_payload
     assert "reader" in terminal_payload
     assert list(pending_requests) == []
