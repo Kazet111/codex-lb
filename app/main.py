@@ -40,6 +40,8 @@ from app.db.session import SessionLocal, close_db, init_background_db, init_db
 from app.modules.accounts import api as accounts_api
 from app.modules.api_keys import api as api_keys_api
 from app.modules.audit import api as audit_api
+from app.modules.automations import api as automations_api
+from app.modules.automations.scheduler import build_automations_scheduler
 from app.modules.dashboard import api as dashboard_api
 from app.modules.dashboard_auth import api as dashboard_auth_api
 from app.modules.firewall import api as firewall_api
@@ -126,9 +128,11 @@ async def lifespan(app: FastAPI):
     usage_scheduler = build_usage_refresh_scheduler()
     model_scheduler = build_model_refresh_scheduler()
     sticky_session_cleanup_scheduler = build_sticky_session_cleanup_scheduler()
+    automations_scheduler = build_automations_scheduler()
     await usage_scheduler.start()
     await model_scheduler.start()
     await sticky_session_cleanup_scheduler.start()
+    await automations_scheduler.start()
     if settings.metrics_enabled and PROMETHEUS_AVAILABLE:
         import uvicorn
 
@@ -283,6 +287,7 @@ async def lifespan(app: FastAPI):
             metrics_server.should_exit = True
 
         await cache_poller.stop()
+        await automations_scheduler.stop()
         await sticky_session_cleanup_scheduler.stop()
         await model_scheduler.stop()
         await usage_scheduler.stop()
@@ -360,6 +365,7 @@ def create_app() -> FastAPI:
     app.include_router(settings_api.router)
     app.include_router(firewall_api.router)
     app.include_router(sticky_sessions_api.router)
+    app.include_router(automations_api.router)
     app.include_router(api_keys_api.router)
     app.include_router(health_api.router)
 
