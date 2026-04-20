@@ -4827,7 +4827,11 @@ class ProxyService:
                     response_id=response_id,
                     fallback_request_state=matched_request_state,
                     prefer_previous_response_not_found=is_previous_response_not_found_event,
-                    allow_precreated_terminal_fallback=event_type in {"response.failed", "response.incomplete", "error"},
+                    allow_precreated_terminal_fallback=event_type in {
+                        "response.failed",
+                        "response.incomplete",
+                        "error",
+                    },
                 )
                 if terminal_request_state is not None:
                     session.queued_request_count = max(0, session.queued_request_count - 1)
@@ -5304,7 +5308,11 @@ class ProxyService:
                     response_id=response_id,
                     fallback_request_state=request_state,
                     prefer_previous_response_not_found=is_previous_response_not_found_event,
-                    allow_precreated_terminal_fallback=event_type in {"response.failed", "response.incomplete", "error"},
+                    allow_precreated_terminal_fallback=event_type in {
+                        "response.failed",
+                        "response.incomplete",
+                        "error",
+                    },
                 )
                 has_other_pending_requests = bool(pending_requests)
             else:
