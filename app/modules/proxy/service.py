@@ -4782,10 +4782,19 @@ class ProxyService:
         event = parse_sse_event(event_block)
         event_type = _event_type_from_payload(event, payload)
         response_id = _websocket_response_id(event, payload)
+        is_previous_response_not_found_event = _is_previous_response_not_found_error(
+            code=_normalize_error_code(
+                _websocket_event_error_code(event_type, payload),
+                _websocket_event_error_type(event_type, payload),
+            ),
+            param=_websocket_event_error_param(event_type, payload),
+            message=_websocket_event_error_message(event_type, payload),
+        )
 
         async with session.pending_lock:
             matched_request_state = None
             created_request_state = None
+            has_other_pending_requests = False
             if event_type == "response.created":
                 matched_request_state = _assign_websocket_response_id(session.pending_requests, response_id)
                 created_request_state = matched_request_state
@@ -4796,8 +4805,11 @@ class ProxyService:
                     response_id,
                 )
                 release_create_gate = False
-            elif response_id is None and len(session.pending_requests) == 1:
-                matched_request_state = session.pending_requests[0]
+            elif response_id is None:
+                matched_request_state = _match_websocket_request_state_for_anonymous_event(
+                    session.pending_requests,
+                    prefer_previous_response_not_found=is_previous_response_not_found_event,
+                )
                 release_create_gate = False
             else:
                 release_create_gate = False
@@ -4814,13 +4826,34 @@ class ProxyService:
                     session.pending_requests,
                     response_id=response_id,
                     fallback_request_state=matched_request_state,
+                    prefer_previous_response_not_found=is_previous_response_not_found_event,
+                    allow_precreated_terminal_fallback=event_type in {"response.failed", "response.incomplete", "error"},
                 )
                 if terminal_request_state is not None:
                     session.queued_request_count = max(0, session.queued_request_count - 1)
+                has_other_pending_requests = bool(session.pending_requests)
+
+        status_request_state = terminal_request_state or matched_request_state
+        if (
+            event_type == "error"
+            and status_request_state is not None
+            and status_request_state.previous_response_id is not None
+            and is_previous_response_not_found_event
+            and has_other_pending_requests
+        ):
+            status_request_state.error_http_status_override = 502
+            event, payload, event_type, rewritten_text = _maybe_rewrite_websocket_previous_response_not_found_event(
+                request_state=status_request_state,
+                event=event,
+                payload=payload,
+                event_type=event_type,
+                upstream_control=session.upstream_control,
+                original_text=text,
+            )
+            event_block = f"data: {rewritten_text}\n\n"
 
         if event_type == "error":
             http_status = _http_error_status_from_payload(payload)
-            status_request_state = terminal_request_state or matched_request_state
             if status_request_state is not None:
                 status_request_state.error_http_status_override = http_status
             (
@@ -5229,6 +5262,14 @@ class ProxyService:
         event = parse_sse_event(event_block)
         event_type = _event_type_from_payload(event, payload)
         response_id = _websocket_response_id(event, payload)
+        is_previous_response_not_found_event = _is_previous_response_not_found_error(
+            code=_normalize_error_code(
+                _websocket_event_error_code(event_type, payload),
+                _websocket_event_error_type(event_type, payload),
+            ),
+            param=_websocket_event_error_param(event_type, payload),
+            message=_websocket_event_error_message(event_type, payload),
+        )
 
         async with pending_lock:
             request_state = None
@@ -5241,8 +5282,11 @@ class ProxyService:
             elif response_id is not None:
                 request_state = _find_websocket_request_state_by_response_id(pending_requests, response_id)
                 release_create_gate = False
-            elif response_id is None and len(pending_requests) == 1:
-                request_state = pending_requests[0]
+            elif response_id is None:
+                request_state = _match_websocket_request_state_for_anonymous_event(
+                    pending_requests,
+                    prefer_previous_response_not_found=is_previous_response_not_found_event,
+                )
                 release_create_gate = False
             else:
                 release_create_gate = False
@@ -5259,6 +5303,8 @@ class ProxyService:
                     pending_requests,
                     response_id=response_id,
                     fallback_request_state=request_state,
+                    prefer_previous_response_not_found=is_previous_response_not_found_event,
+                    allow_precreated_terminal_fallback=event_type in {"response.failed", "response.incomplete", "error"},
                 )
                 has_other_pending_requests = bool(pending_requests)
             else:
@@ -5270,14 +5316,7 @@ class ProxyService:
         if request_state is None:
             return text
 
-        retry_is_previous_response_not_found = _is_previous_response_not_found_error(
-            code=_normalize_error_code(
-                _websocket_event_error_code(event_type, payload),
-                _websocket_event_error_type(event_type, payload),
-            ),
-            param=_websocket_event_error_param(event_type, payload),
-            message=_websocket_event_error_message(event_type, payload),
-        )
+        retry_is_previous_response_not_found = is_previous_response_not_found_event
         retry_error_code = _websocket_precreated_retry_error_code(
             request_state,
             event_type=event_type,
@@ -8005,6 +8044,44 @@ def _assign_websocket_response_id(
     return None
 
 
+def _match_websocket_request_state_for_anonymous_event(
+    pending_requests: deque[_WebSocketRequestState],
+    *,
+    prefer_previous_response_not_found: bool,
+) -> _WebSocketRequestState | None:
+    if len(pending_requests) == 1:
+        return pending_requests[0]
+
+    unresolved_requests = [request_state for request_state in pending_requests if request_state.response_id is None]
+    if len(unresolved_requests) == 1:
+        return unresolved_requests[0]
+
+    if not prefer_previous_response_not_found:
+        return None
+
+    followup_requests = [
+        request_state
+        for request_state in unresolved_requests
+        if request_state.previous_response_id is not None and request_state.awaiting_response_created
+    ]
+    if len(followup_requests) == 1:
+        return followup_requests[0]
+    return None
+
+
+def _match_websocket_request_state_for_precreated_terminal_event(
+    pending_requests: deque[_WebSocketRequestState],
+) -> _WebSocketRequestState | None:
+    unresolved_requests = [
+        request_state
+        for request_state in pending_requests
+        if request_state.response_id is None and request_state.awaiting_response_created
+    ]
+    if len(unresolved_requests) == 1:
+        return unresolved_requests[0]
+    return None
+
+
 def _release_websocket_response_create_gate(
     request_state: _WebSocketRequestState,
     response_create_gate: asyncio.Semaphore,
@@ -8428,6 +8505,8 @@ def _pop_terminal_websocket_request_state(
     *,
     response_id: str | None,
     fallback_request_state: _WebSocketRequestState | None,
+    prefer_previous_response_not_found: bool = False,
+    allow_precreated_terminal_fallback: bool = False,
 ) -> _WebSocketRequestState | None:
     if response_id is not None:
         request_state = _find_websocket_request_state_by_response_id(pending_requests, response_id)
@@ -8437,13 +8516,19 @@ def _pop_terminal_websocket_request_state(
     if fallback_request_state is not None and fallback_request_state in pending_requests:
         pending_requests.remove(fallback_request_state)
         return fallback_request_state
-    unresolved_requests = [request_state for request_state in pending_requests if request_state.response_id is None]
-    if len(unresolved_requests) == 1:
-        request_state = unresolved_requests[0]
-        pending_requests.remove(request_state)
-        return request_state
-    if response_id is None and len(pending_requests) == 1:
-        return pending_requests.popleft()
+    if response_id is not None and allow_precreated_terminal_fallback:
+        request_state = _match_websocket_request_state_for_precreated_terminal_event(pending_requests)
+        if request_state is not None and request_state in pending_requests:
+            pending_requests.remove(request_state)
+            return request_state
+    if response_id is None:
+        request_state = _match_websocket_request_state_for_anonymous_event(
+            pending_requests,
+            prefer_previous_response_not_found=prefer_previous_response_not_found,
+        )
+        if request_state is not None and request_state in pending_requests:
+            pending_requests.remove(request_state)
+            return request_state
     return None
 
 
