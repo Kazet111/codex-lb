@@ -5155,6 +5155,59 @@ async def test_process_upstream_websocket_text_does_not_match_foreign_response_i
 
 
 @pytest.mark.asyncio
+async def test_process_upstream_websocket_text_does_not_match_foreign_completed_event_to_only_unresolved_request(
+    monkeypatch,
+):
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    finalize_request_state = AsyncMock()
+    account = _make_account("acc_ws_pending_precreated")
+
+    monkeypatch.setattr(service, "_finalize_websocket_request_state", finalize_request_state)
+
+    pending_request = proxy_service._WebSocketRequestState(
+        request_id="ws_req_pending_precreated",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        awaiting_response_created=True,
+        request_text=json.dumps(
+            {
+                "type": "response.create",
+                "model": "gpt-5.1",
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "first"}]}],
+            },
+            separators=(",", ":"),
+        ),
+    )
+    pending_requests = deque([pending_request])
+    payload = {
+        "type": "response.completed",
+        "response": {
+            "id": "resp_ws_foreign_completed",
+            "usage": {"input_tokens": 7, "output_tokens": 11, "total_tokens": 18},
+        },
+    }
+
+    downstream_text = await service._process_upstream_websocket_text(
+        json.dumps(payload, separators=(",", ":")),
+        account=account,
+        account_id_value=account.id,
+        pending_requests=pending_requests,
+        pending_lock=anyio.Lock(),
+        api_key=None,
+        upstream_control=proxy_service._WebSocketUpstreamControl(),
+        response_create_gate=asyncio.Semaphore(1),
+    )
+
+    assert downstream_text == json.dumps(payload, separators=(",", ":"))
+    finalize_request_state.assert_not_awaited()
+    assert list(pending_requests) == [pending_request]
+
+
+@pytest.mark.asyncio
 async def test_process_upstream_websocket_text_transparently_retries_precreated_usage_limit_failure(
     monkeypatch,
 ):
@@ -6536,6 +6589,94 @@ async def test_process_upstream_websocket_text_retries_precreated_previous_respo
     assert upstream_control.replay_request_state is pending_request
     assert pending_request.replay_count == 1
     assert list(pending_requests) == []
+
+
+@pytest.mark.asyncio
+async def test_process_upstream_websocket_text_masks_previous_response_not_found_for_unique_followup_request(
+    monkeypatch,
+):
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    finalize_request_state = AsyncMock()
+    handle_stream_error = AsyncMock()
+    account = _make_account("acc_ws_prev_not_found_followup_match")
+
+    monkeypatch.setattr(service, "_finalize_websocket_request_state", finalize_request_state)
+    monkeypatch.setattr(service, "_handle_stream_error", handle_stream_error)
+
+    inflight_request = proxy_service._WebSocketRequestState(
+        request_id="ws_req_inflight",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        awaiting_response_created=True,
+        request_text=json.dumps(
+            {
+                "type": "response.create",
+                "model": "gpt-5.1",
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "first"}]}],
+            },
+            separators=(",", ":"),
+        ),
+    )
+    followup_request = proxy_service._WebSocketRequestState(
+        request_id="ws_req_followup_prev_not_found",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        awaiting_response_created=True,
+        request_text=json.dumps(
+            {
+                "type": "response.create",
+                "model": "gpt-5.1",
+                "previous_response_id": "resp_anchor",
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
+            },
+            separators=(",", ":"),
+        ),
+        previous_response_id="resp_anchor",
+    )
+    pending_requests = deque([inflight_request, followup_request])
+    upstream_control = proxy_service._WebSocketUpstreamControl()
+    upstream_payload = {
+        "type": "error",
+        "status": 400,
+        "error": {
+            "type": "invalid_request_error",
+            "code": "previous_response_not_found",
+            "message": "Previous response with id 'resp_anchor' not found.",
+            "param": "previous_response_id",
+        },
+    }
+    upstream_text = json.dumps(upstream_payload, separators=(",", ":"))
+
+    downstream_text = await service._process_upstream_websocket_text(
+        upstream_text,
+        account=account,
+        account_id_value=account.id,
+        pending_requests=pending_requests,
+        pending_lock=anyio.Lock(),
+        api_key=None,
+        upstream_control=upstream_control,
+        response_create_gate=asyncio.Semaphore(1),
+    )
+
+    assert '"type":"response.failed"' in downstream_text
+    assert '"code":"stream_incomplete"' in downstream_text
+    assert "previous_response_not_found" not in downstream_text
+    handle_stream_error.assert_not_awaited()
+    finalize_request_state.assert_awaited_once()
+    finalize_call = finalize_request_state.await_args
+    assert finalize_call is not None
+    assert finalize_call.args[0] is followup_request
+    assert finalize_call.kwargs["event_type"] == "response.failed"
+    assert upstream_control.reconnect_requested is True
+    assert upstream_control.suppress_downstream_event is False
+    assert list(pending_requests) == [inflight_request]
 
 
 def test_maybe_rewrite_websocket_previous_response_not_found_rewrites_response_failed_event():

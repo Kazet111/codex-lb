@@ -1514,6 +1514,171 @@ def test_backend_responses_websocket_connect_failure_masks_previous_response_not
     assert event["error"]["message"] == "Upstream websocket closed before response.completed"
 
 
+def test_backend_responses_websocket_masks_anonymous_previous_response_not_found_with_inflight_request(
+    app_instance,
+    monkeypatch,
+):
+    fake_upstream = _SequencedUpstreamWebSocket(
+        [],
+        deferred_message_batches=[
+            [
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "response.created",
+                            "response": {"id": "resp_ws_inflight", "status": "in_progress"},
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
+            ],
+            [
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "error",
+                            "status": 400,
+                            "error": {
+                                "type": "invalid_request_error",
+                                "code": "previous_response_not_found",
+                                "message": "Previous response with id 'resp_ws_prev_anchor' not found.",
+                                "param": "previous_response_id",
+                            },
+                        },
+                        separators=(",", ":"),
+                    ),
+                ),
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": "resp_ws_inflight",
+                                "status": "completed",
+                                "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+                            },
+                        },
+                        separators=(",", ":"),
+                    ),
+                ),
+            ],
+        ],
+    )
+    log_calls: list[dict[str, object]] = []
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None):
+        return None
+
+    async def fake_connect_proxy_websocket(
+        self,
+        headers,
+        *,
+        sticky_key,
+        sticky_kind,
+        reallocate_sticky,
+        sticky_max_age_seconds,
+        prefer_earlier_reset,
+        routing_strategy,
+        model,
+        request_state,
+        api_key,
+        client_send_lock,
+        websocket,
+    ):
+        del (
+            self,
+            headers,
+            sticky_key,
+            sticky_kind,
+            reallocate_sticky,
+            sticky_max_age_seconds,
+            prefer_earlier_reset,
+            routing_strategy,
+            model,
+            request_state,
+            api_key,
+            client_send_lock,
+            websocket,
+        )
+        return SimpleNamespace(id="acct_ws_prev_followup"), fake_upstream
+
+    async def fake_write_request_log(self, **kwargs):
+        del self
+        log_calls.append(kwargs)
+
+    async def fake_resolve_previous_response_owner(
+        self,
+        *,
+        previous_response_id,
+        api_key,
+        session_id=None,
+        surface,
+    ):
+        del self, previous_response_id, api_key, session_id, surface
+        return None
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fake_connect_proxy_websocket)
+    monkeypatch.setattr(proxy_module.ProxyService, "_write_request_log", fake_write_request_log)
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_resolve_websocket_previous_response_owner",
+        fake_resolve_previous_response_owner,
+    )
+
+    first_request = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "first"}]}],
+        "stream": True,
+    }
+    followup_request = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "previous_response_id": "resp_ws_prev_anchor",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
+        "stream": True,
+    }
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(
+            "/backend-api/codex/responses",
+            headers={"Authorization": "Bearer external-token"},
+        ) as websocket:
+            websocket.send_text(json.dumps(first_request))
+            created_event = json.loads(websocket.receive_text())
+
+            websocket.send_text(json.dumps(followup_request))
+            failed_event = json.loads(websocket.receive_text())
+            completed_event = json.loads(websocket.receive_text())
+
+    assert created_event["type"] == "response.created"
+    assert created_event["response"]["id"] == "resp_ws_inflight"
+    assert failed_event["type"] == "response.failed"
+    assert failed_event["response"]["error"]["code"] == "stream_incomplete"
+    assert failed_event["response"]["error"]["message"] == "Upstream websocket closed before response.completed"
+    assert "previous_response_not_found" not in json.dumps(failed_event)
+    assert completed_event["type"] == "response.completed"
+    assert completed_event["response"]["id"] == "resp_ws_inflight"
+    assert any(call["status"] == "error" and call["error_code"] == "stream_incomplete" for call in log_calls)
+    assert any(call["status"] == "success" and call["request_id"] == "resp_ws_inflight" for call in log_calls)
+    assert fake_upstream.closed is True
+
+
 @pytest.mark.parametrize("frame", ['{"type":"response.create"', "[]"])
 def test_backend_responses_websocket_rejects_malformed_first_frame_as_invalid_payload(app_instance, monkeypatch, frame):
     called = {"connect": False}
@@ -3018,27 +3183,26 @@ def test_backend_responses_websocket_emits_no_accounts_error(app_instance, monke
 
 
 def test_backend_responses_websocket_matches_terminal_events_by_response_id(app_instance, monkeypatch):
-    upstream_messages = [
-        _FakeUpstreamMessage(
-            "text",
-            text=json.dumps(
-                {"type": "response.created", "response": {"id": "resp_ws_a", "status": "in_progress"}},
-                separators=(",", ":"),
-            ),
-        ),
-        _FakeUpstreamMessage(
-            "text",
-            text=json.dumps(
-                {"type": "response.created", "response": {"id": "resp_ws_b", "status": "in_progress"}},
-                separators=(",", ":"),
-            ),
-        ),
-    ]
     fake_upstream = _SequencedUpstreamWebSocket(
-        upstream_messages,
+        [],
         deferred_message_batches=[
-            [],
             [
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {"type": "response.created", "response": {"id": "resp_ws_a", "status": "in_progress"}},
+                        separators=(",", ":"),
+                    ),
+                )
+            ],
+            [
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {"type": "response.created", "response": {"id": "resp_ws_b", "status": "in_progress"}},
+                        separators=(",", ":"),
+                    ),
+                ),
                 _FakeUpstreamMessage(
                     "text",
                     text=json.dumps(
