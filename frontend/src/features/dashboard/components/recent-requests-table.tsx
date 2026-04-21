@@ -31,6 +31,7 @@ import {
   formatCompactNumber,
   formatCurrency,
   formatModelLabel,
+  formatSlug,
   formatTimeLong,
 } from "@/utils/formatters";
 
@@ -52,6 +53,13 @@ const TRANSPORT_CLASS_MAP: Record<string, string> = {
   websocket: "bg-sky-500/15 text-sky-700 border-sky-500/20 hover:bg-sky-500/20 dark:text-sky-300",
   automation:
     "bg-indigo-500/15 text-indigo-700 border-indigo-500/20 hover:bg-indigo-500/20 dark:text-indigo-300",
+};
+
+const PLAN_CLASS_MAP: Record<string, string> = {
+  free: "bg-zinc-500/10 text-zinc-700 border-zinc-500/20 hover:bg-zinc-500/15 dark:text-zinc-300",
+  plus: "bg-emerald-500/15 text-emerald-700 border-emerald-500/20 hover:bg-emerald-500/20 dark:text-emerald-400",
+  team: "bg-sky-500/15 text-sky-700 border-sky-500/20 hover:bg-sky-500/20 dark:text-sky-300",
+  pro: "bg-violet-500/15 text-violet-700 border-violet-500/20 hover:bg-violet-500/20 dark:text-violet-300",
 };
 
 export type RecentRequestsTableProps = {
@@ -112,11 +120,12 @@ export function RecentRequestsTable({
     <div className="space-y-3">
     <div className="rounded-xl border bg-card">
       <div className="relative overflow-x-auto">
-        <Table className="min-w-[1160px] table-fixed">
+        <Table className="min-w-[1240px] table-fixed">
           <TableHeader>
             <TableRow className="hover:bg-transparent">
               <TableHead className="w-28 pl-4 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">Time</TableHead>
               <TableHead className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">Account</TableHead>
+              <TableHead className="w-24 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">Plan</TableHead>
               <TableHead className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">API Key</TableHead>
               <TableHead className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">Model</TableHead>
               <TableHead className="w-32 pr-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">Transport</TableHead>
@@ -136,6 +145,8 @@ export function RecentRequestsTable({
               const visibleServiceTier = request.actualServiceTier ?? request.serviceTier;
               const showRequestedTier =
                 !!request.requestedServiceTier && request.requestedServiceTier !== visibleServiceTier;
+              const planType = request.planType?.trim().toLowerCase() || null;
+              const planLabel = planType ? formatSlug(planType) : "--";
 
               return (
                 <TableRow key={request.requestId}>
@@ -150,6 +161,18 @@ export function RecentRequestsTable({
                       <span className="privacy-blur">{accountLabel}</span>
                     ) : (
                       accountLabel
+                    )}
+                  </TableCell>
+                  <TableCell className="align-top">
+                    {planType ? (
+                      <Badge
+                        variant="outline"
+                        className={PLAN_CLASS_MAP[planType] ?? PLAN_CLASS_MAP.free}
+                      >
+                        {planLabel}
+                      </Badge>
+                    ) : (
+                      <span className="text-xs text-muted-foreground">--</span>
                     )}
                   </TableCell>
                   <TableCell className="truncate align-top text-xs text-muted-foreground">
@@ -265,6 +288,7 @@ export function RecentRequestsTable({
               <div className="grid gap-3 sm:grid-cols-3">
                 <RequestDetailField label="Status" value={selectedRequest ? (REQUEST_STATUS_LABELS[selectedRequest.status] ?? selectedRequest.status) : "—"} />
                 <RequestDetailField label="Model" value={selectedRequest ? formatModelLabel(selectedRequest.model, selectedRequest.reasoningEffort, selectedRequest.actualServiceTier ?? selectedRequest.serviceTier) : "—"} mono />
+                <RequestDetailField label="Plan" value={selectedRequest?.planType ? formatSlug(selectedRequest.planType) : "—"} />
                 <RequestDetailField label="Transport" value={selectedRequest?.transport ? (TRANSPORT_LABELS[selectedRequest.transport] ?? selectedRequest.transport) : "—"} />
                 <RequestDetailField label="Time" value={selectedRequest ? formatDateTimeInline(selectedRequest.requestedAt) : "—"} />
                 <RequestDetailField label="Error Code" value={selectedRequest?.errorCode ?? "—"} mono />
