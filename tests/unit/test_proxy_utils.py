@@ -7242,6 +7242,105 @@ async def test_proxy_responses_websocket_previous_response_owner_lookup_failure_
 
 
 @pytest.mark.asyncio
+async def test_stream_with_retry_releases_api_key_reservation_when_owner_lookup_fails(monkeypatch):
+    request_logs = _RequestLogsRecorder()
+    api_keys_repo = cast(ApiKeysRepository, AsyncMock())
+    api_keys_repo.get_usage_reservation = AsyncMock(return_value=SimpleNamespace(status="reserved", items=[]))
+    api_keys_repo.transition_usage_reservation_status = AsyncMock(return_value=True)
+    api_keys_repo.settle_usage_reservation = AsyncMock()
+    api_keys_repo.commit = AsyncMock()
+
+    class _RepoContextWithApiKeys:
+        def __init__(self) -> None:
+            self._repos = ProxyRepositories(
+                accounts=cast(AccountsRepository, AsyncMock()),
+                usage=cast(UsageRepository, AsyncMock()),
+                request_logs=cast(RequestLogsRepository, request_logs),
+                sticky_sessions=cast(StickySessionsRepository, AsyncMock()),
+                api_keys=api_keys_repo,
+                additional_usage=cast(AdditionalUsageRepository, AsyncMock()),
+            )
+
+        async def __aenter__(self) -> ProxyRepositories:
+            return self._repos
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+    service = proxy_service.ProxyService(lambda: _RepoContextWithApiKeys())
+    settings = _make_proxy_settings(log_proxy_service_tier_trace=False)
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+
+    api_key = ApiKeyData(
+        id="key_owner_lookup_fail_release",
+        name="owner-lookup-fail-release",
+        key_prefix="sk-clb-owner",
+        allowed_models=None,
+        enforced_model=None,
+        enforced_reasoning_effort=None,
+        enforced_service_tier=None,
+        expires_at=None,
+        is_active=True,
+        created_at=utcnow(),
+        last_used_at=None,
+    )
+    reservation = proxy_service.ApiKeyUsageReservationData(
+        reservation_id="resv_owner_lookup_fail",
+        key_id=api_key.id,
+        model="gpt-5.4",
+    )
+    payload = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.4",
+            "instructions": "continue",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
+            "previous_response_id": "resp_owner_lookup_fail",
+            "stream": True,
+        }
+    )
+
+    owner_lookup_error = proxy_module.ProxyResponseError(
+        503,
+        openai_error(
+            "upstream_unavailable",
+            "Previous response owner lookup failed; retry later.",
+            error_type="server_error",
+        ),
+    )
+    owner_lookup = AsyncMock(side_effect=owner_lookup_error)
+    monkeypatch.setattr(service, "_resolve_websocket_previous_response_owner", owner_lookup)
+    select_account = AsyncMock(side_effect=AssertionError("owner lookup failure must happen before account selection"))
+    monkeypatch.setattr(service, "_select_account_with_budget_compatible", select_account)
+
+    with pytest.raises(proxy_module.ProxyResponseError) as exc_info:
+        async for _ in service._stream_with_retry(
+            payload,
+            {"x-codex-turn-state": "turn_owner_lookup_fail"},
+            codex_session_affinity=False,
+            propagate_http_errors=False,
+            openai_cache_affinity=False,
+            api_key=api_key,
+            api_key_reservation=reservation,
+            suppress_text_done_events=False,
+            request_transport="http",
+        ):
+            pass
+
+    assert _proxy_error_code(exc_info.value) == "upstream_unavailable"
+    owner_lookup.assert_awaited_once()
+    select_account.assert_not_called()
+    api_keys_repo.get_usage_reservation.assert_awaited_once_with(reservation.reservation_id)
+    api_keys_repo.transition_usage_reservation_status.assert_awaited_once_with(
+        reservation.reservation_id,
+        expected_status="reserved",
+        new_status="released",
+    )
+    api_keys_repo.settle_usage_reservation.assert_awaited_once()
+    api_keys_repo.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_resolve_websocket_previous_response_owner_rechecks_same_scope_after_initial_miss(monkeypatch):
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))

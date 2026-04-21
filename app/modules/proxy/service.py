@@ -255,6 +255,12 @@ def _resolve_upstream_stream_transport(upstream_stream_transport: str) -> str | 
     return upstream_stream_transport
 
 
+def _fingerprint_input_items(items: Sequence[JsonValue]) -> str:
+    """Return stable SHA-256 fingerprint for input list canonical JSON."""
+    canonical = json.dumps(list(items), ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    return sha256(canonical.encode("utf-8")).hexdigest()
+
+
 class ProxyService:
     def __init__(self, repo_factory: ProxyRepoFactory) -> None:
         self._repo_factory = repo_factory
@@ -482,6 +488,7 @@ class ProxyService:
             logger.warning("Durable bridge lookup failed; falling back to non-durable request handling", exc_info=True)
             durable_lookup = None
         effective_payload = payload
+        proxy_injected_previous_response_id = False
         if durable_lookup is not None:
             bridge_session_key = _HTTPBridgeSessionKey(
                 durable_lookup.canonical_kind,
@@ -505,6 +512,7 @@ class ProxyService:
                 effective_payload = payload.model_copy(
                     update={"previous_response_id": durable_lookup.latest_response_id}
                 )
+                proxy_injected_previous_response_id = True
                 _log_http_bridge_event(
                     "fresh_reattach_anchor_injected",
                     bridge_session_key,
@@ -724,6 +732,61 @@ class ProxyService:
                             session.last_used_at = time.monotonic()
                 return
         session = session_or_forward
+        # Trim already-stored prefix when previous_response_id anchors context.
+        has_previous_response_id = (
+            proxy_injected_previous_response_id or effective_payload.previous_response_id is not None
+        )
+        incoming_input = effective_payload.input
+        stored_count = session.last_completed_input_count
+        stored_fingerprint = session.last_completed_input_prefix_fingerprint
+        if (
+            has_previous_response_id
+            and stored_count > 0
+            and stored_fingerprint is not None
+            and isinstance(incoming_input, list)
+            and len(incoming_input) > stored_count
+        ):
+            incoming_input_list = cast(list[JsonValue], incoming_input)
+            incoming_prefix_fingerprint = _fingerprint_input_items(incoming_input_list[:stored_count])
+            if incoming_prefix_fingerprint == stored_fingerprint:
+                original_count = len(incoming_input_list)
+                trimmed_input = incoming_input_list[stored_count:]
+                trimmed_payload = effective_payload.model_copy(update={"input": trimmed_input})
+                previous_preferred_account_id = request_state.preferred_account_id
+                request_state, text_data = self._prepare_http_bridge_request(
+                    trimmed_payload,
+                    headers,
+                    api_key=api_key,
+                    api_key_reservation=api_key_reservation,
+                    request_id=request_id,
+                )
+                if downstream_turn_state is not None:
+                    request_state.session_id = _normalize_session_id(downstream_turn_state)
+                request_state.transport = _REQUEST_TRANSPORT_HTTP
+                request_state.request_stage = _http_bridge_request_stage(
+                    headers=headers,
+                    payload=trimmed_payload,
+                    durable_lookup=durable_lookup,
+                )
+                request_state.preferred_account_id = previous_preferred_account_id
+                request_state.input_item_count = original_count
+                request_state.input_full_fingerprint = _fingerprint_input_items(incoming_input_list)
+                logger.info(
+                    "store_context_input_trimmed request_id=%s original_items=%s trimmed_to=%s previous_response_id=%s",
+                    request_id,
+                    original_count,
+                    len(trimmed_input),
+                    effective_payload.previous_response_id,
+                )
+            else:
+                logger.warning(
+                    "store_context_input_trim_skipped_prefix_mismatch request_id=%s incoming_items=%s "
+                    "stored_items=%s previous_response_id=%s",
+                    request_id,
+                    len(incoming_input_list),
+                    stored_count,
+                    effective_payload.previous_response_id,
+                )
         session_events: AsyncGenerator[str, None] = self._stream_http_bridge_session_events(
             session,
             request_state=request_state,
@@ -2267,6 +2330,15 @@ class ProxyService:
         if client_metadata:
             upstream_payload["client_metadata"] = client_metadata
         forwarded_service_tier = _normalize_service_tier_value(upstream_payload.get("service_tier"))
+        input_item_count = 0
+        input_full_fingerprint: str | None = None
+        payload_input = payload.input
+        if isinstance(payload_input, list):
+            payload_input_list = cast(list[JsonValue], payload_input)
+            input_item_count = len(payload_input_list)
+            if input_item_count > 0:
+                input_full_fingerprint = _fingerprint_input_items(payload_input_list)
+
         request_state = _WebSocketRequestState(
             request_id=request_id or f"ws_{uuid4().hex}",
             request_log_id=request_log_id,
@@ -2282,6 +2354,8 @@ class ProxyService:
             api_key=api_key,
             previous_response_id=payload.previous_response_id,
             session_id=_normalize_session_id(session_id),
+            input_item_count=input_item_count,
+            input_full_fingerprint=input_full_fingerprint,
         )
         text_data = json.dumps(upstream_payload, ensure_ascii=True, separators=(",", ":"))
         payload_size = len(text_data.encode("utf-8"))
@@ -4911,6 +4985,14 @@ class ProxyService:
             )
             event_block = f"data: {rewritten_text}\n\n"
 
+        if (
+            event_type == "response.completed"
+            and terminal_request_state is not None
+            and terminal_request_state.input_item_count > 0
+        ):
+            session.last_completed_input_count = terminal_request_state.input_item_count
+            session.last_completed_input_prefix_fingerprint = terminal_request_state.input_full_fingerprint
+
         if event_type == "error":
             http_status = _http_error_status_from_payload(payload)
             if status_request_state is not None:
@@ -6177,15 +6259,15 @@ class ProxyService:
         excluded_account_ids: set[str] = set()
         preferred_account_id: str | None = None
         require_preferred_account = False
-        if payload.previous_response_id is not None:
-            preferred_account_id = await self._resolve_websocket_previous_response_owner(
-                previous_response_id=payload.previous_response_id,
-                api_key=api_key,
-                session_id=_owner_lookup_session_id_from_headers(headers),
-                surface="http_stream",
-            )
-            require_preferred_account = preferred_account_id is not None
         try:
+            if payload.previous_response_id is not None:
+                preferred_account_id = await self._resolve_websocket_previous_response_owner(
+                    previous_response_id=payload.previous_response_id,
+                    api_key=api_key,
+                    session_id=_owner_lookup_session_id_from_headers(headers),
+                    surface="http_stream",
+                )
+                require_preferred_account = preferred_account_id is not None
             for attempt in range(max_attempts):
                 remaining_budget = _remaining_budget_seconds(deadline)
                 if remaining_budget <= 0:
@@ -7580,6 +7662,8 @@ class _WebSocketRequestState:
     response_create_gate: asyncio.Semaphore | None = None
     response_create_admission: AdmissionLease | None = None
     affinity_policy: _AffinityPolicy = field(default_factory=_AffinityPolicy)
+    input_item_count: int = 0
+    input_full_fingerprint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -7629,6 +7713,8 @@ class _HTTPBridgeSession:
     downstream_turn_state: str | None = None
     downstream_turn_state_aliases: set[str] = field(default_factory=set)
     previous_response_ids: set[str] = field(default_factory=set)
+    last_completed_input_count: int = 0
+    last_completed_input_prefix_fingerprint: str | None = None
     durable_session_id: str | None = None
     durable_owner_epoch: int | None = None
     upstream_reader: asyncio.Task[None] | None = None
