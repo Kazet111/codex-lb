@@ -191,12 +191,6 @@ _STREAM_STARTUP_ERROR_PROBE_SECONDS = 0.05
 # Keep bridge startup probing above tiny event-loop scheduling jitter:
 # PostgreSQL-backed failures may need a DB round trip before the first item.
 _HTTP_BRIDGE_STARTUP_ERROR_PROBE_SECONDS = 0.5
-_V1_FULL_CONTEXT_WINDOW_OVERRIDES: Final[dict[str, int]] = {
-    "gpt-5.4": 1_000_000,
-    "gpt-5.5": 400_000,
-    "gpt-5.4-mini": 400_000,
-    "gpt-5.3-codex": 400_000,
-}
 _V1_MAX_OUTPUT_TOKEN_OVERRIDES: Final[dict[str, int]] = {
     "gpt-5.4": 128_000,
     "gpt-5.5": 128_000,
@@ -1511,6 +1505,7 @@ async def _build_codex_models_response(api_key: ApiKeyData | None) -> Response:
     )
 
     allowed_models = _allowed_models_for_api_key(api_key)
+    visibility_allowed_models = _codex_model_visibility_allowed_models(api_key)
 
     registry = get_model_registry()
     models = registry.get_models_with_fallback()
@@ -1521,9 +1516,17 @@ async def _build_codex_models_response(api_key: ApiKeyData | None) -> Response:
 
     entries: list[CodexModelEntry] = []
     for slug, model in models.items():
-        if not is_public_model(model, allowed_models):
+        if visibility_allowed_models is None:
+            if not is_public_model(model, allowed_models):
+                continue
+            entries.append(_to_codex_model_entry(model))
             continue
-        entries.append(_to_codex_model_entry(model))
+        entries.append(
+            _to_codex_model_entry(
+                model,
+                visibility="list" if slug in visibility_allowed_models else "hide",
+            )
+        )
     await _release_reservation(reservation)
     return JSONResponse(content=CodexModelsResponse(models=entries).model_dump(mode="json"))
 
@@ -1569,7 +1572,13 @@ def _allowed_models_for_api_key(api_key: ApiKeyData | None) -> set[str] | None:
     return allowed_models
 
 
-def _to_codex_model_entry(model: UpstreamModel) -> CodexModelEntry:
+def _codex_model_visibility_allowed_models(api_key: ApiKeyData | None) -> set[str] | None:
+    if api_key is None or not api_key.apply_to_codex_model or not api_key.allowed_models:
+        return None
+    return _allowed_models_for_api_key(api_key)
+
+
+def _to_codex_model_entry(model: UpstreamModel, *, visibility: str | None = None) -> CodexModelEntry:
     raw = model.raw
 
     extra: dict[str, JsonValue] = {}
@@ -1623,7 +1632,7 @@ def _to_codex_model_entry(model: UpstreamModel) -> CodexModelEntry:
         input_modalities=list(model.input_modalities),
         available_in_plans=sorted(model.available_in_plans),
         prefer_websockets=model.prefer_websockets,
-        visibility=_model_visibility(model),
+        visibility=visibility or _model_visibility(model),
         **extra,
     )
 
@@ -1633,34 +1642,13 @@ def _effective_context_window(model: UpstreamModel) -> int:
     return overrides.get(model.slug, model.context_window)
 
 
-def _raw_positive_int(raw: Mapping[str, JsonValue], key: str) -> int | None:
-    value = raw.get(key)
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        return None
-    return value
-
-
 def _v1_full_context_window(model: UpstreamModel) -> int:
     overrides = get_settings().model_context_window_overrides
-    explicit_override = overrides.get(model.slug)
-    if explicit_override is not None:
-        return explicit_override
-
-    known_context_window = _V1_FULL_CONTEXT_WINDOW_OVERRIDES.get(model.slug)
-    if known_context_window is not None:
-        return known_context_window
-
-    upstream_context_window = model.context_window
-    raw_max_context_window = _raw_positive_int(model.raw, "max_context_window")
-    if raw_max_context_window is not None and raw_max_context_window > upstream_context_window:
-        return raw_max_context_window
-
-    return upstream_context_window
+    return overrides.get(model.slug, model.context_window)
 
 
-def _v1_input_context_window(model: UpstreamModel) -> int | None:
-    input_context_window = model.context_window
-    return input_context_window if input_context_window != _v1_full_context_window(model) else None
+def _v1_input_context_window(model: UpstreamModel) -> int:
+    return model.context_window
 
 
 def _v1_max_output_tokens(model: UpstreamModel) -> int | None:
