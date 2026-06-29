@@ -109,6 +109,23 @@ Alternative considered:
 - embed inside existing settings tabs.
 Rejected due to scope growth and degraded task-focused UX.
 
+### 7) Reconcile concurrent migration branches with a merge revision
+
+Decision:
+- retain the already-published `main` and automations revision histories,
+- preserve the prerelease integration revision ID already recorded by local Docker volumes,
+- add a final no-op Alembic merge revision whose parents are both current heads.
+
+Why:
+- existing databases may have advanced along either branch,
+- prerelease Docker volumes at the integration revision must remain upgradeable after the contributor branch rebase,
+- rewriting an existing revision would make migration history inconsistent across deployments,
+- Docker startup targets `head` and therefore requires one unambiguous graph head.
+
+Alternative considered:
+- change startup to upgrade `heads`.
+Rejected because it would hide unresolved migration branches instead of enforcing the repository's single-head invariant.
+
 ## Risks / Trade-offs
 
 - [Scheduler drift / delayed trigger due to polling interval] -> keep interval short and compute due-slot deterministically per timezone.
@@ -121,12 +138,13 @@ Rejected due to scope growth and degraded task-focused UX.
 ## Migration Plan
 
 1. Apply Alembic migration creating automation tables, indexes, and cycle snapshot tables.
-2. Deploy backend with API + scheduler (enabled by config).
-3. Deploy frontend with `Automations` route/navigation.
-4. Verify:
+2. Apply the compatibility and final merge revisions that join the automations branch to the latest `main` migration head.
+3. Deploy backend with API + scheduler (enabled by config).
+4. Deploy frontend with `Automations` route/navigation.
+5. Verify:
    - `ruff`, `ty`, backend pytest suite, frontend vitest suite,
    - OpenSpec validation for specs/tasks.
-5. Rollback:
+6. Rollback:
    - disable scheduler via config flag if runtime issue occurs,
    - rollback app deployment first; DB tables can remain safely unused until full rollback migration is required.
 
