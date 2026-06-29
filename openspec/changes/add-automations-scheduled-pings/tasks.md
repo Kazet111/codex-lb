@@ -13,6 +13,7 @@
 - [x] 2.4 Implement ping execution + account failover policy for retryable account errors (rate-limit/quota/deactivated/auth failures).
 - [x] 2.5 Persist run outcomes (`success`, `failed`, `partial`) with error code/message for GUI visibility.
 - [x] 2.6 Implement `run-now` endpoint execution path reusing the same run persistence/failover engine.
+- [x] 2.7 Merge the automations migration branch with the latest `main` head while preserving prerelease integration revision compatibility.
 
 ## 3. Frontend
 
@@ -28,3 +29,4 @@
 - [x] 4.3 Add frontend tests for navigation, form validation, create/update flows, and run-history rendering.
 - [x] 4.4 Run full verification suite (`uv run pytest`, `uvx ruff check .`, `uv run ty check`).
 - [x] 4.5 Run frontend test suite (`cd frontend && bun run test`).
+- [x] 4.6 Verify fresh migrations and upgrades from both former Alembic heads reach one merged head.
